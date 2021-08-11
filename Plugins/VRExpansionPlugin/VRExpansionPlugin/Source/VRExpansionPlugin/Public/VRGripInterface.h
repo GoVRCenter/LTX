@@ -10,13 +10,21 @@
 
 #include "VRGripInterface.generated.h"
 
+// Forward declare
+class UGripMotionControllerComponent;
 
 UINTERFACE(Blueprintable)
-class UVRGripInterface: public UInterface
+class VREXPANSIONPLUGIN_API UVRGripInterface: public UInterface
 {
 	GENERATED_UINTERFACE_BODY()
 };
 
+
+/** Delegate for notification when the controller grips a new object. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVROnGripSignature, UGripMotionControllerComponent *, GrippingController, const FBPActorGripInformation&, GripInformation);
+
+/** Delegate for notification when the controller drops a gripped object. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FVROnDropSignature, UGripMotionControllerComponent*, GrippingController, const FBPActorGripInformation&, GripInformation, bool, bWasSocketed);
 
 class VREXPANSIONPLUGIN_API IVRGripInterface
 {
@@ -26,7 +34,7 @@ public:
 
 	// Set up as deny instead of allow so that default allows for gripping
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface", meta = (DisplayName = "IsDenyingGrips"))
-		bool DenyGripping();
+		bool DenyGripping(UGripMotionControllerComponent * GripInitiator = nullptr);
 
 	// How an interfaced object behaves when teleporting
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
@@ -64,9 +72,15 @@ public:
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
 		float GripBreakDistance();
 
-	// Get closest slot in range
+	/**
+	 * Called to get the closest grip socket in range
+	 * @param WorldLocation - World Location to check near
+	 * @param bSecondarySlot - True if this is a check for a secondary slot or not
+	 * @param CallingController - Controller checking for the slot (can be used in overrides for per hand checks)
+	 * @param OverridePrefix - A different substring to check against in the socket names to find relevant ones
+	 */
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
-		void ClosestGripSlotInRange(FVector WorldLocation, bool bSecondarySlot,  bool & bHadSlotInRange, FTransform & SlotWorldTransform, UGripMotionControllerComponent * CallingController = nullptr, FName OverridePrefix = NAME_None);
+		void ClosestGripSlotInRange(FVector WorldLocation, bool bSecondarySlot,  bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent * CallingController = nullptr, FName OverridePrefix = NAME_None);
 
 	// Events that can be called for interface inheriting actors
 
@@ -138,5 +152,5 @@ public:
 
 	// Get grip scripts
 	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripInterface")
-		bool GetGripScripts(TArray<UVRGripScriptBase*> & ArrayReference);
+		bool GetGripScripts(TArray<UVRGripScriptBase*>& ArrayReference);
 };

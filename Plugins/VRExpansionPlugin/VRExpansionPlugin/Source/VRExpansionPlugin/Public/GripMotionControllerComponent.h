@@ -14,6 +14,7 @@
 #include "VRGripInterface.h"
 #include "VRGlobalSettings.h"
 #include "GripScripts/VRGripScriptBase.h"
+#include "Math/DualQuat.h"
 #include "XRMotionControllerBase.h" // for GetHandEnumForSourceName()
 #include "GripMotionControllerComponent.generated.h"
 
@@ -23,18 +24,34 @@ class AVRBaseCharacter;
 *
 */
 
+/** Override replication control variable for inherited properties that are private. Be careful since it removes a compile-time error when the variable doesn't exist */
+// This is a temp macro until epic adds their own equivilant
+#define DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(c,v,active) \
+{ \
+	static FProperty* sp##v = GetReplicatedProperty(StaticClass(), c::StaticClass(),FName(TEXT(#v))); \
+	for (int32 i = 0; i < sp##v->ArrayDim; i++) \
+	{ \
+		ChangedPropertyTracker.SetCustomIsActiveOverride(this, sp##v->RepIndex + i, active); \
+	} \
+}
+
+#define RESET_REPLIFETIME_CONDITION_PRIVATE_PROPERTY(c,v,cond)  ResetReplicatedLifetimeProperty(StaticClass(), c::StaticClass(), FName(TEXT(#v)), cond, OutLifetimeProps);
+
 DECLARE_LOG_CATEGORY_EXTERN(LogVRMotionController, Log, All);
 //For UE4 Profiler ~ Stat Group
 DECLARE_STATS_GROUP(TEXT("TICKGrip"), STATGROUP_TickGrip, STATCAT_Advanced);
 
-/** Delegate for notification when the controller grips a new object. */
+/** Delegate for notification when the controllers tracking changes. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVRGripControllerOnTrackingEventSignature, const ETrackingStatus &, NewTrackingStatus);
 
 /** Delegate for notification when the controller grips a new object. */
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVRGripControllerOnGripSignature, const FBPActorGripInformation &, GripInformation);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVROnControllerGripSignature, const FBPActorGripInformation &, GripInformation);
 
 /** Delegate for notification when the controller drops a gripped object. */
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVRGripControllerOnDropSignature, const FBPActorGripInformation &, GripInformation, bool, bWasSocketed);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVROnControllerDropSignature, const FBPActorGripInformation &, GripInformation, bool, bWasSocketed);
+
+/** Delegate for notification when the controller teleports its grips. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVROnControllerTeleportedGripsSignature);
 
 /** Delegate for notification when an interactive grip goes out of range and isn't set to auto handle it. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVRGripControllerOnGripOutOfRange, const FBPActorGripInformation &, GripInformation, float, Distance);
@@ -64,8 +81,8 @@ public:
 public:
 
 	/** A utility method that calls CacheSceneInfo on ParentComponent and all of its descendants */
-	void GatherLateUpdatePrimitives(USceneComponent* ParentComponent, TArray<USceneComponent*> *SkipComponentList = nullptr);
-	void ProcessGripArrayLateUpdatePrimitives(UGripMotionControllerComponent* MotionController, TArray<FBPActorGripInformation> & GripArray, TArray<USceneComponent*> &SkipComponentList);
+	void GatherLateUpdatePrimitives(USceneComponent* ParentComponent);
+	void ProcessGripArrayLateUpdatePrimitives(UGripMotionControllerComponent* MotionController, TArray<FBPActorGripInformation> & GripArray);
 
 	/** Generates a LateUpdatePrimitiveInfo for the given component if it has a SceneProxy and appends it to the current LateUpdatePrimitives array */
 	void CacheSceneInfo(USceneComponent* Component);
@@ -94,6 +111,39 @@ public:
 };
 
 /**
+* Tick function that does post physics work. This executes in EndPhysics (after physics is done)
+**/
+USTRUCT()
+struct FGripComponentEndPhysicsTickFunction : public FTickFunction
+{
+	GENERATED_USTRUCT_BODY()
+
+		UGripMotionControllerComponent* Target;
+
+	/**
+	* Abstract function to execute the tick.
+	* @param DeltaTime - frame time to advance, in seconds.
+	* @param TickType - kind of tick for this frame.
+	* @param CurrentThread - thread we are executing on, useful to pass along as new tasks are created.
+	* @param MyCompletionGraphEvent - completion event for this task. Useful for holding the completetion of this task until certain child tasks are complete.
+	*/
+	virtual void ExecuteTick(float DeltaTime, enum ELevelTick TickType, ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent) override;
+	/** Abstract function to describe this tick. Used to print messages about illegal cycles in the dependency graph. */
+	virtual FString DiagnosticMessage() override;
+	/** Function used to describe this tick for active tick reporting. **/
+	virtual FName DiagnosticContext(bool bDetailed) override;
+};
+
+template<>
+struct TStructOpsTypeTraits<FGripComponentEndPhysicsTickFunction> : public TStructOpsTypeTraitsBase2<FGripComponentEndPhysicsTickFunction>
+{
+	enum
+	{
+		WithCopy = false
+	};
+};
+
+/**
 * An override of the MotionControllerComponent that implements position replication and Gripping with grip replication and controllable late updates per object.
 */
 UCLASS(Blueprintable, meta = (BlueprintSpawnableComponent), ClassGroup = MotionController)
@@ -101,6 +151,17 @@ class VREXPANSIONPLUGIN_API UGripMotionControllerComponent : public UMotionContr
 {
 
 public:
+
+	FGripComponentEndPhysicsTickFunction EndPhysicsTickFunction;
+	friend struct FGripComponentEndPhysicsTickFunction;
+
+	/** Update systems after physics sim is done */
+	void EndPhysicsTickComponent(FGripComponentEndPhysicsTickFunction& ThisTickFunction);
+	void RegisterEndPhysicsTick(bool bRegister);
+
+
+
+
 
 	// The grip script that defines the default behaviors of grips
 	// Don't edit this unless you really know what you are doing, leave it empty
@@ -113,12 +174,66 @@ public:
 	UPROPERTY(VisibleAnywhere, Transient, BlueprintReadOnly, Category = "GripMotionController")
 	UVRGripScriptBase* DefaultGripScript;
 
+	// Lerping functions and events
+	void InitializeLerpToHand(FBPActorGripInformation& GripInfo);
+	void HandleGlobalLerpToHand(FBPActorGripInformation& GripInformation, FTransform& WorldTransform, float DeltaTime);
+
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
+		void CancelGlobalLerpToHand(uint8 GripID);
+
+	//UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+	//	FVROnControllerGripSignature OnLerpToHandBegin;
+
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerGripSignature OnLerpToHandFinished;
+
 	// If true will subtract the HMD's location from the position, useful for if the actors base is set to the HMD location always (simple character).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController")
 	bool bOffsetByHMD;
-	
+
+	UPROPERTY()
+		TWeakObjectPtr<AVRBaseCharacter> AttachChar;
+	void UpdateTracking(float DeltaTime);
+	virtual void OnAttachmentChanged() override;
+
 	FVector LastLocationForLateUpdate;
 	FTransform LastRelativePosition;
+
+	// If true will smooth the hand tracking data with a TInterp function
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController|Smoothing")
+		bool bSmoothHandTracking;
+
+	bool bWasSmoothingHand;
+
+	// If true will smooth hand tracking with the Linear and Rotational 1 Euro low pass settings instead
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController|Smoothing")
+		bool bSmoothWithEuroLowPassFunction;
+
+	// The interp speed to use if smoothing is enabled and not using the 1 Euro smoothing
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController|Smoothing")
+		float SmoothingSpeed;
+
+	// Smoothing parameters when using the 1 Euro low pass option
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController|Smoothing")
+		FBPEuroLowPassFilterTrans EuroSmoothingParams;
+
+	FTransform LastSmoothRelativeTransform;
+
+	// Type of velocity calculation to use for the motion controller
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController|ComponentVelocity")
+		EVRVelocityType VelocityCalculationType;
+
+	// If we should sample the velocity in world or local space
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController|ComponentVelocity")
+		bool bSampleVelocityInWorldSpace;
+
+	// If not using velocity mode "default" this is the number of sample to keep
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController|ComponentVelocity")
+		int32 VelocitySamples;
+
+	FBPLowPassPeakFilter PeakFilter;
+
+	virtual FVector GetComponentVelocity() const override;
 
 	// If true will offset the tracked location of the controller by the controller profile that is currently loaded.
 	// Thows the event OnControllerProfileTransformChanged when it happens so that you can adjust specific components
@@ -153,12 +268,17 @@ public:
 	virtual void OnUnregister() override;
 	//virtual void PreReplication(IRepChangedPropertyTracker & ChangedPropertyTracker) override;
 	virtual void Deactivate() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void BeginDestroy() override;
 	virtual void BeginPlay() override;
 
+	/** Post-physics tick function for this character */
+	//UPROPERTY()
+	//	FTickFunction PostPhysicsTickFunction;
+
 protected:
 	//~ Begin UActorComponent Interface.
-	virtual void CreateRenderState_Concurrent() override;
+	virtual void CreateRenderState_Concurrent(FRegisterComponentContext* Context) override;
 	virtual void SendRenderTransform_Concurrent() override;
 	//~ End UActorComponent Interface.
 
@@ -178,33 +298,66 @@ public:
 		FVRGripControllerOnTrackingEventSignature OnTrackingChanged;
 
 	// Called when a object is gripped
-	UPROPERTY(BlueprintAssignable, Category = "GripMotionController")
-		FVRGripControllerOnGripSignature OnGrippedObject;
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerGripSignature OnGrippedObject;
 
 	// Called when a object is dropped
-	UPROPERTY(BlueprintAssignable, Category = "GripMotionController")
-		FVRGripControllerOnDropSignature OnDroppedObject;
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerDropSignature OnDroppedObject;
+
+	// Called when a gripped object has been teleported
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerTeleportedGripsSignature OnTeleportedGrips;
+
+	// Called when an object we hold is secondary gripped
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerGripSignature OnSecondaryGripAdded;
+
+	// Called when an object we hold is secondary dropped
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerGripSignature OnSecondaryGripRemoved;
+
+	// Called when an object we hold has its grip transform changed
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerGripSignature OnGripTransformChanged;
 
 	// Gets the hand enum
 	UFUNCTION(BlueprintPure, Category = "VRExpansionFunctions", meta = (bIgnoreSelf = "true", DisplayName = "HandType", CompactNodeTitle = "HandType"))
 		void GetHandType(EControllerHand& Hand);
 
 	// The component to use for basing the grip off of instead of the motion controller
-	UPROPERTY(BlueprintReadWrite, Category = "GripMotionController")
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "GripMotionController|CustomPivot")
 		TWeakObjectPtr<USceneComponent> CustomPivotComponent;
 
+	// The socket for the component to use for basing the grip off of instead of the motion controller
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "GripMotionController|CustomPivot")
+		FName CustomPivotComponentSocketName;
+
+	// If true then we will skip the pivot transform adjustment when gripping an object with the custom pivot
+	// This is here for legacy support for anyone not using "ConvertToControllerRelativeTransform".
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "GripMotionController|CustomPivot")
+		bool bSkipPivotTransformAdjustment;
+
 	// Set the custom pivot component, allows you to use remote grips easier
-	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
-		void SetCustomPivotComponent(USceneComponent * NewCustomPivotComponent);
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController|CustomPivot")
+		void SetCustomPivotComponent(USceneComponent * NewCustomPivotComponent, FName PivotSocketName = NAME_None);
+
+	// Set the custom pivot component, allows you to use remote grips easier
+	UFUNCTION(BlueprintPure, Category = "GripMotionController", meta = (DisplayName = "GetPivotTransform"))
+		FTransform GetPivotTransform_BP();
+
+	// Set the custom pivot component, allows you to use remote grips easier
+	UFUNCTION(BlueprintPure, Category = "GripMotionController", meta = (DisplayName = "GetPivotLocation"))
+		FVector GetPivotLocation_BP();
 
 	FORCEINLINE FTransform GetPivotTransform()
 	{
-		return CustomPivotComponent.IsValid() ? CustomPivotComponent->GetComponentTransform() : this->GetComponentTransform();
+		return CustomPivotComponent.IsValid() ? CustomPivotComponent->GetSocketTransform(CustomPivotComponentSocketName) : this->GetComponentTransform();
 	}
 
 	FORCEINLINE FVector GetPivotLocation()
 	{
-		return CustomPivotComponent.IsValid() ? CustomPivotComponent->GetComponentLocation() : this->GetComponentLocation();
+		return CustomPivotComponent.IsValid() ? CustomPivotComponent->GetSocketLocation(CustomPivotComponentSocketName) : this->GetComponentLocation();
 	}
 
 	// Increments with each grip, wraps back to 0 after max due to modulo operation
@@ -227,14 +380,27 @@ public:
 
 			return GripIDIncrementer;
 		}
-		else // And 128 - 254 for local grips client side
+		else // And 128 - 254 for local grips client side, with half for server initiated and half for client
 		{
-			if (GripIDIncrementer < 127)
-				GripIDIncrementer++;
-			else
-				GripIDIncrementer = (INVALID_VRGRIP_ID + 1);
 
-			return GripIDIncrementer + 128;
+			if (!IsServer())
+			{
+				if (GripIDIncrementer < 63)
+					GripIDIncrementer++;
+				else
+					GripIDIncrementer = (INVALID_VRGRIP_ID + 1);
+
+				return GripIDIncrementer + 128;
+			}
+			else
+			{
+				if (GripIDIncrementer < 63)
+					GripIDIncrementer++;
+				else
+					GripIDIncrementer = (INVALID_VRGRIP_ID + 1);
+
+				return GripIDIncrementer + 128 + 64;
+			}
 		}
 	}
 
@@ -246,11 +412,15 @@ public:
 	UPROPERTY(BlueprintReadOnly, Replicated, Category = "GripMotionController", ReplicatedUsing = OnRep_LocallyGrippedObjects)
 	TArray<FBPActorGripInformation> LocallyGrippedObjects;
 
+	// Local Grip TransactionalBuffer to store server sided grips that need to be emplaced into the local buffer
+	UPROPERTY(BlueprintReadOnly, Replicated, Category = "GripMotionController", ReplicatedUsing = OnRep_LocalTransaction)
+		TArray<FBPActorGripInformation> LocalTransactionBuffer;
+
 	// Locally Gripped Array functions
 
 	// Notify a client that their local grip was bad
-	UFUNCTION(Reliable, Client, WithValidation, Category = "GripMotionController")
-	void Client_NotifyInvalidLocalGrip(UObject * LocallyGrippedObject);
+	UFUNCTION(Reliable, Client, Category = "GripMotionController")
+	void Client_NotifyInvalidLocalGrip(UObject * LocallyGrippedObject, uint8 GripID);
 
 	// Notify the server that we locally gripped something
 	UFUNCTION(Reliable, Server, WithValidation, Category = "GripMotionController")
@@ -274,6 +444,9 @@ public:
 	UFUNCTION(Reliable, Server, WithValidation)
 	void Server_NotifyLocalGripRemoved(uint8 GripID, const FTransform_NetQuantize &TransformAtDrop, FVector_NetQuantize100 AngularVelocity, FVector_NetQuantize100 LinearVelocity);
 	
+	// Handle a server initiated grip
+	UFUNCTION(Reliable, Server, WithValidation, Category = "GripMotionController")
+		void Server_NotifyHandledTransaction(uint8 GripID);
 
 	// Enable this to send the TickGrip event every tick even for non custom grip types - has a slight performance hit
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController")
@@ -287,6 +460,20 @@ public:
 	// If FullRecreate is false then it will only set the COM and actors, otherwise will re-init the entire grip
 	bool UpdatePhysicsHandle(uint8 GripID, bool bFullyRecreate = true);
 	bool UpdatePhysicsHandle(const FBPActorGripInformation & GripInfo, bool bFullyRecreate = true);
+
+	inline void NotifyGripTransformChanged(const FBPActorGripInformation & GripInfo)
+	{
+		if (OnGripTransformChanged.IsBound())
+		{
+			FBPActorGripInformation CurrentGrip;
+			EBPVRResultSwitch Result;
+			GetGripByID(CurrentGrip, GripInfo.GripID, Result);
+			if (Result == EBPVRResultSwitch::OnSucceeded)
+			{
+				OnGripTransformChanged.Broadcast(CurrentGrip);
+			}
+		}
+	}
 
 	// Recreates a grip in situations where the collision type or movement replication type may have been changed
 	inline void ReCreateGrip(FBPActorGripInformation & GripInfo)
@@ -337,6 +524,39 @@ public:
 				//UE_LOG(LogVRMotionController, Warning, TEXT("Replicated grip Notify grip failed, was grip called before the object was replicated to the client?"));
 				return false;
 			}
+
+			if(Grip.SecondaryGripInfo.bHasSecondaryAttachment)
+			{
+				// Reset the secondary grip distance
+				Grip.SecondaryGripInfo.SecondaryGripDistance = 0.0f;
+
+				if (FMath::IsNearlyZero(Grip.SecondaryGripInfo.LerpToRate)) // Zero, could use IsNearlyZero instead
+					Grip.SecondaryGripInfo.GripLerpState = EGripLerpState::NotLerping;
+				else
+				{
+					Grip.SecondaryGripInfo.curLerp = Grip.SecondaryGripInfo.LerpToRate;
+					Grip.SecondaryGripInfo.GripLerpState = EGripLerpState::StartLerp;
+				}
+
+				if (Grip.GrippedObject && Grip.GrippedObject->IsValidLowLevelFast() && Grip.GrippedObject->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
+				{
+					IVRGripInterface::Execute_OnSecondaryGrip(Grip.GrippedObject, this, Grip.SecondaryGripInfo.SecondaryAttachment, Grip);
+
+					TArray<UVRGripScriptBase*> GripScripts;
+					if (IVRGripInterface::Execute_GetGripScripts(Grip.GrippedObject, GripScripts))
+					{
+						for (UVRGripScriptBase* Script : GripScripts)
+						{
+							if (Script)
+							{
+								Script->OnSecondaryGrip(this, Grip.SecondaryGripInfo.SecondaryAttachment, Grip);
+							}
+						}
+					}
+				}
+
+				OnSecondaryGripAdded.Broadcast(Grip);	
+			}
 			//Grip.ValueCache.bWasInitiallyRepped = true; // Set has been initialized
 		}
 		else if(OldGripInfo != nullptr) // Check for changes from cached information if we aren't skipping the delta check
@@ -375,7 +595,7 @@ public:
 
 				if (bSendReleaseEvent)
 				{
-					if (Grip.GrippedObject && Grip.GrippedObject->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
+					if (Grip.GrippedObject && Grip.GrippedObject->IsValidLowLevelFast() && Grip.GrippedObject->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
 					{
 						IVRGripInterface::Execute_OnSecondaryGripRelease(Grip.GrippedObject, this, OldGripInfo->SecondaryGripInfo.SecondaryAttachment, Grip);
 
@@ -391,11 +611,13 @@ public:
 							}
 						}
 					}
+
+					OnSecondaryGripRemoved.Broadcast(Grip);
 				}
 
 				if (bSendGripEvent)
 				{
-					if (Grip.GrippedObject && Grip.GrippedObject->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
+					if (Grip.GrippedObject && Grip.GrippedObject->IsValidLowLevelFast() && Grip.GrippedObject->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
 					{
 						IVRGripInterface::Execute_OnSecondaryGrip(Grip.GrippedObject, this, Grip.SecondaryGripInfo.SecondaryAttachment, Grip);
 
@@ -411,6 +633,8 @@ public:
 							}
 						}
 					}
+
+					OnSecondaryGripAdded.Broadcast(Grip);
 				}
 			}
 
@@ -424,14 +648,21 @@ public:
 			}
 			else // If re-creating the grip anyway we don't need to do the below
 			{
+				bool bTransformChanged = !OldGripInfo->RelativeTransform.Equals(Grip.RelativeTransform);
+
 				// If physics settings got changed server side
 				if (!FMath::IsNearlyEqual(OldGripInfo->Stiffness, Grip.Stiffness) ||
 					!FMath::IsNearlyEqual(OldGripInfo->Damping, Grip.Damping) ||
 					OldGripInfo->AdvancedGripSettings.PhysicsSettings != Grip.AdvancedGripSettings.PhysicsSettings ||
-					!OldGripInfo->RelativeTransform.Equals(Grip.RelativeTransform)
+					bTransformChanged
 					)
 				{
 					UpdatePhysicsHandle(Grip);
+
+					if (bTransformChanged)
+					{
+						NotifyGripTransformChanged(Grip);
+					}
 				}
 			}
 		}
@@ -440,6 +671,44 @@ public:
 		Grip.ValueCache.CachedGripID = Grip.GripID;
 
 		return true;
+	}
+
+	inline void CheckTransactionBuffer()
+	{
+		if (LocalTransactionBuffer.Num())
+		{
+			for (int i = LocalTransactionBuffer.Num() - 1; i >= 0; --i)
+			{
+				if (LocalTransactionBuffer[i].ValueCache.bWasInitiallyRepped && LocalTransactionBuffer[i].GripID != LocalTransactionBuffer[i].ValueCache.CachedGripID)
+				{
+					// There appears to be a bug with TArray replication where if you replace an index with another value of that
+					// Index, it doesn't fully re-init the object, this is a workaround to re-zero non replicated variables
+					// when that happens.
+					LocalTransactionBuffer[i].ClearNonReppingItems();
+				}
+
+				if (!LocalTransactionBuffer[i].ValueCache.bWasInitiallyRepped && LocalTransactionBuffer[i].GrippedObject->IsValidLowLevelFast())
+				{
+					LocalTransactionBuffer[i].ValueCache.bWasInitiallyRepped = true;
+					LocalTransactionBuffer[i].ValueCache.CachedGripID = LocalTransactionBuffer[i].GripID;
+
+					int32 Index = LocallyGrippedObjects.Add(LocalTransactionBuffer[i]);
+
+					if (Index != INDEX_NONE)
+					{
+						NotifyGrip(LocallyGrippedObjects[Index]);
+					}
+
+					Server_NotifyHandledTransaction(LocalTransactionBuffer[i].GripID);				
+				}
+			}
+		}
+	}
+
+	UFUNCTION()
+	virtual void OnRep_LocalTransaction(TArray<FBPActorGripInformation> OriginalArrayState) // Original array state is useless without full serialize, it just hold last delta
+	{
+		CheckTransactionBuffer();
 	}
 
 	UFUNCTION()
@@ -552,15 +821,7 @@ public:
 	{
 		if (GEngine != nullptr && GWorld != nullptr)
 		{
-			switch (GEngine->GetNetMode(GWorld))
-			{
-			case NM_Client: 
-			{return false;} break;
-			case NM_DedicatedServer:
-			case NM_ListenServer:
-			default: 
-			{return true; } break;
-			}
+			return GEngine->GetNetMode(GWorld) < NM_Client;
 		}
 
 		return false;
@@ -577,8 +838,9 @@ public:
 	// This is to avoid a race condition where we need to wait for the next physics update.
 	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
 		bool DropAndSocketGrip(const FBPActorGripInformation &GripToDrop, USceneComponent * SocketingParent, FName OptionalSocketName, const FTransform_NetQuantize & RelativeTransformToParent, bool bWeldBodies = true);
-
-	// Notify the server about a new drop and socket
+		bool DropAndSocketGrip_Implementation(const FBPActorGripInformation& GripToDrop, USceneComponent* SocketingParent, FName OptionalSocketName, const FTransform_NetQuantize& RelativeTransformToParent, bool bWeldBodies = true, bool bSkipServerNotify = false);
+	
+		// Notify the server about a new drop and socket
 	UFUNCTION(Reliable, Server, WithValidation, Category = "GripMotionController")
 		void Server_NotifyDropAndSocketGrip(uint8 GripID, USceneComponent * SocketingParent, FName OptionalSocketName, const FTransform_NetQuantize & RelativeTransformToParent, bool bWeldBodies = true);
 
@@ -606,7 +868,10 @@ public:
 	You could pass in a socket relative transform with this set for snapping or an empty transform to snap the object at its 0,0,0 point.
 
 	If you declare a valid OptionSnapToSocketName then it will instead snap the actor to the relative offset
-	location that the socket is to its parent actor.
+	location that the socket is to its parent actor. 
+	
+	It will only do this if the WorldOffset value is left default, if it is not, then it will treat this as the name of the slot
+	that you already have the transform for.
 
 	If you declare a valid OptionalBoneToGripName then it will grip that physics body with physics grips (It will expect a bone worldspace transform then,
 	if you pass in the normal actor/root component world space transform then the grip will not be positioned correctly).
@@ -637,7 +902,7 @@ public:
 
 	// Auto grip any uobject that is/root is a primitive component
 	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
-		bool GripObjectByInterface(UObject * ObjectToGrip, const FTransform &WorldOffset, bool bWorldOffsetIsRelative = false, FName OptionalBoneToGripName = NAME_None, bool bIsSlotGrip = false);
+		bool GripObjectByInterface(UObject * ObjectToGrip, const FTransform &WorldOffset, bool bWorldOffsetIsRelative = false, FName OptionalBoneToGripName = NAME_None, FName OptionalSnapToSocketName = NAME_None, bool bIsSlotGrip = false);
 
 	// Auto drop any uobject that is/root is a primitive component and has the VR Grip Interface
 	// If an object is passed in it will attempt to drop it, otherwise it will attempt to find and drop the given grip id
@@ -653,6 +918,9 @@ public:
 
 	   If you declare a valid OptionSnapToSocketName then it will instead snap the actor to the relative offset
 	   location that the socket is to its parent actor.
+
+		It will only do this if the WorldOffset value is left default, if it is not, then it will treat this as the name of the slot
+		that you already have the transform for.
 
 	   If you declare a valid OptionalBoneToGripName then it will grip that physics body with physics grips (It will expect a bone worldspace transform then, 
 	   if you pass in the normal actor/root component world space transform then the grip will not be positioned correctly).
@@ -685,7 +953,7 @@ public:
 	bool GripComponent(
 		UPrimitiveComponent* ComponentToGrip, 
 		const FTransform &WorldOffset, bool bWorldOffsetIsRelative = false, 
-		FName OptionalBoneToGrip_Name = NAME_None, 
+		FName OptionalsnapToSocketName = NAME_None, 
 		FName OptionalBoneToGripName = NAME_None,
 		EGripCollisionType GripCollisionType = EGripCollisionType::InteractiveCollisionWithPhysics, 
 		EGripLateUpdateSettings GripLateUpdateSetting = EGripLateUpdateSettings::NotWhenCollidingOrDoubleGripping,
@@ -710,6 +978,13 @@ public:
 		bool bSimulate = false, 
 		FVector OptionalAngularVelocity = FVector::ZeroVector, 
 		FVector OptionalLinearVelocity = FVector::ZeroVector);
+
+	bool DropGrip_Implementation(
+		const FBPActorGripInformation& Grip,
+		bool bSimulate = false,
+		FVector OptionalAngularVelocity = FVector::ZeroVector,
+		FVector OptionalLinearVelocity = FVector::ZeroVector,
+		bool bSkipNotify = false);
 
 	// No Longer replicated, called via on rep now instead.
 	//UFUNCTION(Reliable, NetMulticast)
@@ -744,6 +1019,14 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GripMotionController")
 		void GetPhysicsVelocities(const FBPActorGripInformation &Grip, FVector &AngularVelocity, FVector &LinearVelocity);
 
+	// Get the physics constraint force of a simulating grip
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
+		bool GetPhysicsConstraintForce(const FBPActorGripInformation& Grip, FVector& AngularForce, FVector& LinearForce);
+
+	// Get the root components mass of a grip
+	UFUNCTION(BlueprintPure, Category = "GripMotionController")
+		void GetGripMass(const FBPActorGripInformation& Grip, float& Mass);
+
 	// Sets whether an active grip is paused or not (is not replicated by default as it is likely you will want to pass variables with this setting).
 	// If you want it server authed you should RPC a bool down with any additional information (ie: attach location).
 	UFUNCTION(BlueprintCallable, Category = "GripMotionController", meta = (ExpandEnumAsExecs = "Result"))
@@ -752,6 +1035,14 @@ public:
 			EBPVRResultSwitch &Result,
 			bool bIsPaused = false,
 			bool bNoConstraintWhenPaused = false
+		);
+
+	// Sets whether an active hybrid grip is locked to its soft setting (is not replicated by default as it is likely you will want to pass variables with this setting).
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController", meta = (ExpandEnumAsExecs = "Result"))
+		void SetGripHybridLock(
+			const FBPActorGripInformation& Grip,
+			EBPVRResultSwitch& Result,
+			bool bIsLocked = false
 		);
 
 	// Sets the transform to stay at during pause
@@ -829,7 +1120,7 @@ public:
 	// Returns if we have grip authority (can call drop / grip on this grip)
 	// Mostly for networked games as local grips are client authed and all others are server authed
 	UFUNCTION(BlueprintPure, Category = "GripMotionController", meta = (DisplayName = "HasGripAuthority"))
-		bool BP_HasGripAuthority(const FBPActorGripInformation &Grip);
+		bool BP_HasGripAuthority(const FBPActorGripInformation & Grip);
 
 	// Returns if we have grip authority (can call drop / grip on this grip)
 	// Mostly for networked games as local grips are client authed and all others are server authed
@@ -837,12 +1128,12 @@ public:
 		bool BP_HasGripAuthorityForObject(const UObject* ObjToCheck);
 
 	// Checks if we should be handling the movement of a grip based on settings for it
-	inline bool HasGripMovementAuthority(const FBPActorGripInformation &Grip);
+	inline bool HasGripMovementAuthority(const FBPActorGripInformation & Grip);
 
 	// Returns if we have grip movement authority (we handle movement of the grip)
 	// Mostly for networked games where ClientSide will be true for all and ServerSide will be true for server only
 	UFUNCTION(BlueprintPure, Category = "GripMotionController", meta = (DisplayName = "HasGripMovementAuthority"))
-		bool BP_HasGripMovementAuthority(const FBPActorGripInformation &Grip);
+		bool BP_HasGripMovementAuthority(const FBPActorGripInformation & Grip);
 
 	// Running the gripping logic in its own function as the main tick was getting bloated
 	void TickGrip(float DeltaTime);
@@ -888,19 +1179,19 @@ public:
 		bool HasGrippedObjects();
 
 	// Get list of all gripped objects grip info structures (local and normal both)
-	UFUNCTION(BlueprintPure, Category = "GripMotionController")
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
 		void GetAllGrips(TArray<FBPActorGripInformation> &GripArray);
 
 	// Get list of all gripped actors
-	UFUNCTION(BlueprintPure, Category = "GripMotionController")
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
 	void GetGrippedActors(TArray<AActor*> &GrippedActorArray);
 
 	// Get list of all gripped objects
-	UFUNCTION(BlueprintPure, Category = "GripMotionController")
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
 	void GetGrippedObjects(TArray<UObject*> &GrippedObjectsArray);
 
 	// Get list of all gripped components
-	UFUNCTION(BlueprintPure, Category = "GripMotionController")
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
 	void GetGrippedComponents(TArray<UPrimitiveComponent*> &GrippedComponentsArray);
 
 	// After teleporting a pawn you NEED to call this, otherwise gripped objects will travel with a sweeped move and can get caught on geometry
@@ -927,14 +1218,21 @@ public:
 	bool TeleportMoveGrip(UPARAM(ref)FBPActorGripInformation &Grip, bool bTeleportPhysicsGrips = true, bool bIsForPostTeleport = false);
 	bool TeleportMoveGrip_Impl(FBPActorGripInformation &Grip, bool bTeleportPhysicsGrips, bool bIsForPostTeleport, FTransform & OptionalTransform);
 
-	// Adds a secondary attachment point to the grip
+	// Moves all grips back into position immediately
 	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
-	bool AddSecondaryAttachmentPoint(UObject * GrippedObjectToAddAttachment, USceneComponent * SecondaryPointComponent, const FTransform &OriginalTransform, bool bTransformIsAlreadyRelative = false, float LerpToTime = 0.25f, bool bIsSlotGrip = false);
+		void TeleportMoveGrips(bool bTeleportPhysicsGrips = true, bool bIsForPostTeleport = false);
 
 	// Adds a secondary attachment point to the grip
 	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
-	bool AddSecondaryAttachmentToGrip(const FBPActorGripInformation & GripToAddAttachment, USceneComponent * SecondaryPointComponent, const FTransform &OriginalTransform, bool bTransformIsAlreadyRelative = false, float LerpToTime = 0.25f, bool bIsSlotGrip = false);
+	bool AddSecondaryAttachmentPoint(UObject * GrippedObjectToAddAttachment, USceneComponent * SecondaryPointComponent, const FTransform &OriginalTransform, bool bTransformIsAlreadyRelative = false, float LerpToTime = 0.25f, bool bIsSlotGrip = false, FName SecondarySlotName = NAME_None);
 
+	// Adds a secondary attachment point to the grip
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
+	bool AddSecondaryAttachmentToGrip(const FBPActorGripInformation & GripToAddAttachment, USceneComponent * SecondaryPointComponent, const FTransform &OriginalTransform, bool bTransformIsAlreadyRelative = false, float LerpToTime = 0.25f, bool bIsSlotGrip = false, FName SecondarySlotName = NAME_None);
+
+	// Adds a secondary attachment point to the grip
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
+		bool AddSecondaryAttachmentToGripByID(const uint8 GripID, USceneComponent* SecondaryPointComponent, const FTransform& OriginalTransform, bool bTransformIsAlreadyRelative = false, float LerpToTime = 0.25f, bool bIsSlotGrip = false, FName SecondarySlotName = NAME_None);
 
 	// Removes a secondary attachment point from a grip
 	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
@@ -943,6 +1241,10 @@ public:
 	// Removes a secondary attachment point from a grip
 	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
 		bool RemoveSecondaryAttachmentFromGrip(const FBPActorGripInformation & GripToRemoveAttachment, float LerpToTime = 0.25f);
+
+	// Removes a secondary attachment point from a grip
+	UFUNCTION(BlueprintCallable, Category = "GripMotionController")
+		bool RemoveSecondaryAttachmentFromGripByID(const uint8 GripID = 0, float LerpToTime = 0.25f);
 
 	// This is for testing, setting it to true allows you to test grip with a non VR enabled pawn
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController")

@@ -11,6 +11,7 @@
 #include "HeadMountedDisplayFunctionLibrary.h"
 //#include "HeadMountedDisplayFunctionLibrary.h"
 #include "IHeadMountedDisplay.h"
+#include "Grippables/GrippablePhysicsReplication.h"
 
 #include "VRBPDatatypes.h"
 #include "GameplayTagContainer.h"
@@ -40,6 +41,10 @@ class VREXPANSIONPLUGIN_API UVRExpansionFunctionLibrary : public UBlueprintFunct
 	GENERATED_BODY()
 	//~UVRExpansionFunctionLibrary();
 public:
+
+	// Applies a delta rotation around a pivot point, if bUseOriginalYawOnly is true then it only takes the original Yaw into account (characters)
+	UFUNCTION(BlueprintCallable, Category = "VRExpansionFunctions", meta = (bIgnoreSelf = "true"))
+		static void SetObjectsIgnoreCollision(UPrimitiveComponent* Prim1 = nullptr, FName OptionalBoneName1 = NAME_None, UPrimitiveComponent* Prim2 = nullptr, FName OptionalBoneName2 = NAME_None, bool bIgnoreCollision = true);
 
 	UFUNCTION(BlueprintPure, Category = "VRExpansionFunctions", meta = (bIgnoreSelf = "true", DisplayName = "GetHandFromMotionSourceName"))
 	static bool GetHandFromMotionSourceName(FName MotionSource, EControllerHand& Hand)
@@ -113,6 +118,13 @@ public:
 		}
 	}
 
+	// Returns a delta rotation to have Vec1 point towards Vec2, assumes that the v
+	UFUNCTION(BlueprintPure, Category = "VRExpansionFunctions", meta = (bIgnoreSelf = "true", DisplayName = "FindBetween"))
+		static FRotator BPQuat_FindBetween(FVector Vec1, FVector Vec2)
+	{
+		return FQuat::FindBetween(Vec1, Vec2).Rotator();
+	}
+
 	// Gets whether an HMD device is connected
 	UFUNCTION(BlueprintPure, Category = "VRExpansionFunctions", meta = (bIgnoreSelf = "true", DisplayName = "GetIsHMDConnected"))
 	static bool GetIsHMDConnected();
@@ -160,11 +172,11 @@ public:
 
 	// Gets if an actors root component contains a grip slot within range
 	UFUNCTION(BlueprintPure, Category = "VRGrip", meta = (bIgnoreSelf = "true", DisplayName = "GetGripSlotInRangeByTypeName"))
-	static void GetGripSlotInRangeByTypeName(FName SlotType, AActor * Actor, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform);
+	static void GetGripSlotInRangeByTypeName(FName SlotType, AActor * Actor, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent* QueryController = nullptr);
 
 	// Gets if an actors root component contains a grip slot within range
 	UFUNCTION(BlueprintPure, Category = "VRGrip", meta = (bIgnoreSelf = "true", DisplayName = "GetGripSlotInRangeByTypeName_Component"))
-	static void GetGripSlotInRangeByTypeName_Component(FName SlotType, UPrimitiveComponent * Component, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform);
+	static void GetGripSlotInRangeByTypeName_Component(FName SlotType, UPrimitiveComponent * Component, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent* QueryController = nullptr);
 
 	/* Returns true if the values are equal (A == B) */
 	UFUNCTION(BlueprintPure, meta = (DisplayName = "Equal VR Grip", CompactNodeTitle = "==", Keywords = "== equal"), Category = "VRExpansionFunctions")
@@ -219,6 +231,28 @@ public:
 	UFUNCTION(BlueprintCallable, meta = (DisplayName = "Add Scene Component By Class"), Category = "VRExpansionLibrary")
 		static USceneComponent* AddSceneComponentByClass(UObject* Outer, TSubclassOf<USceneComponent> Class, const FTransform & ComponentRelativeTransform);
 	
+
+	/** Resets a Filter so that the first time it is used again it is clean */
+	UFUNCTION(BlueprintCallable, Category = "LowPassFilter_Peak")
+		static void ResetPeakLowPassFilter(UPARAM(ref) FBPLowPassPeakFilter& TargetPeakFilter)
+	{
+		TargetPeakFilter.Reset();
+	}
+
+	/** Adds an entry to the Peak low pass filter */
+	UFUNCTION(BlueprintCallable, Category = "LowPassFilter_Peak")
+		static void UpdatePeakLowPassFilter(UPARAM(ref) FBPLowPassPeakFilter& TargetPeakFilter, FVector NewSample)
+	{
+		TargetPeakFilter.AddSample(NewSample);
+	}
+
+	/** Gets the peak value of the Peak Low Pass Filter */
+	UFUNCTION(BlueprintCallable, Category = "LowPassFilter_Peak")
+		static FVector GetPeak_PeakLowPassFilter(UPARAM(ref) FBPLowPassPeakFilter& TargetPeakFilter)
+	{
+		return TargetPeakFilter.GetPeak();
+	}
+
 
 	/** Resets a Euro Low Pass Filter so that the first time it is used again it is clean */
 	UFUNCTION(BlueprintCallable, Category = "EuroLowPassFilter")

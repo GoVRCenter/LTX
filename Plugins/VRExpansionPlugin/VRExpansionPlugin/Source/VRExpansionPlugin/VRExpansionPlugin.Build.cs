@@ -58,7 +58,7 @@ public class VRExpansionPlugin : ModuleRules
                     "CoreUObject",
                     "Engine",
                    // "InputCore",
-                    "PhysX",
+                    "PhysicsCore",
                     //"FLEX", remove comment if building in the NVIDIA flex branch - NOTE when put in place FLEX only listed win32 and win64 at compatible platforms
                     "HeadMountedDisplay",
                    // "RHI",
@@ -69,10 +69,21 @@ public class VRExpansionPlugin : ModuleRules
                     "UMG",
                     "NavigationSystem",
                     "AIModule",
+                    "AnimGraphRuntime"
 
                     //"Renderer",
                     //"UtilityShaders"
         });
+
+        if (Target.bCompilePhysX)
+        {
+            PublicDependencyModuleNames.Add("PhysX");
+        }
+
+        if(Target.bUseChaos)
+        {
+            PublicDependencyModuleNames.Add("Chaos");
+        }
 
 
         PrivateDependencyModuleNames.AddRange(
@@ -91,13 +102,20 @@ public class VRExpansionPlugin : ModuleRules
                 "NetworkReplayStreaming",
                 "AIModule",
                 "UMG",
-                "GameplayTags",
-                "PhysXVehicles"
-
+                "GameplayTags"
                 //"Renderer",
                // "UtilityShaders"
             });
 
+        if (Target.bCompilePhysX)
+        {
+            PublicDependencyModuleNames.Add("PhysXVehicles");
+        }
+
+        if (Target.bUseChaos)
+        {
+            //PublicDependencyModuleNames.Add("ChaosVehiclesPlugin");
+        }
 
 
         PrivateDependencyModuleNames.AddRange(

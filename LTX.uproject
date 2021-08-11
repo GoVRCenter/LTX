@@ -1,6 +1,6 @@
 {
 	"FileVersion": 3,
-	"EngineAssociation": "4.24",
+	"EngineAssociation": "{B65BFE99-4D48-D82D-E178-DA8BE8E0582F}",
 	"Category": "",
 	"Description": "",
 	"Modules": [
@@ -21,8 +21,7 @@
 			"SupportedTargetPlatforms": [
 				"Win32",
 				"Win64",
-				"Linux",
-				"Mac"
+				"Linux"
 			]
 		},
 		{

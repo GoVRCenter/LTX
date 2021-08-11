@@ -2,6 +2,7 @@
 
 #include "VRStereoWidgetComponent.h"
 #include "VRExpansionFunctionLibrary.h"
+#include "VRBaseCharacter.h"
 #include "TextureResource.h"
 #include "Engine/Texture.h"
 #include "IStereoLayers.h"
@@ -23,8 +24,8 @@
 //#include "PhysicsEngine/BoxElem.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "Slate/SGameLayerManager.h"
-#include "Slate/WidgetRenderer.h"
 #include "Slate/SWorldWidgetScreenLayer.h"
+#include "Widgets/SViewport.h"
 #include "Widgets/SViewport.h"
 
 // CVars
@@ -34,9 +35,319 @@ namespace StereoWidgetCvars
 	FAutoConsoleVariableRef CVarForceNoStereoWithVRWidgets(
 		TEXT("vr.ForceNoStereoWithVRWidgets"),
 		ForceNoStereoWithVRWidgets,
-		TEXT("When on, will not allow stereo widget components to use stereo layers, will instead fall back to default widget rendering.\n")
-		TEXT("0: Disable, 1: Enable"),
+		TEXT("When set to 0, will render stereo layer widgets as stereo by default.\n")
+		TEXT("When set to 1, will not allow stereo widget components to use stereo layers, will instead fall back to default widget rendering.\n")
+		TEXT("When set to 2, will render stereo layer widgets as both stereo and in game.\n")
+		TEXT("0: Default, 1: Force no stereo, 2: Render both at once"),
 		ECVF_Default);
+}
+
+UVRStereoWidgetRenderComponent::UVRStereoWidgetRenderComponent(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	Widget = nullptr;
+	WidgetRenderScale = 1.0f;
+	WidgetRenderGamma = 1.0f;
+	bUseGammaCorrection = false;
+	WidgetRenderer = nullptr;
+	RenderTarget = nullptr;
+	bDrawAtDesiredSize = true;
+	RenderTargetClearColor = FLinearColor::Black;
+	bDrawWithoutStereo = false;
+	DrawRate = 60.0f;
+	DrawCounter = 0.0f;
+	bLiveTexture = true;
+}
+
+void UVRStereoWidgetRenderComponent::TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+
+	IStereoLayers* StereoLayers;
+	if (!GetVisibleFlag() || (!bDrawWithoutStereo && (!GEngine->StereoRenderingDevice.IsValid() || (StereoLayers = GEngine->StereoRenderingDevice->GetStereoLayers()) == nullptr)))
+	{
+	}
+	else
+	{
+		DrawCounter += DeltaTime;
+
+		if (DrawRate > 0.0f && DrawCounter >= (1.0f / DrawRate))
+		{
+			if (!IsRunningDedicatedServer())
+			{
+				RenderWidget(DeltaTime);
+			}
+
+			if (!bLiveTexture)
+			{
+				MarkStereoLayerDirty();
+			}
+
+			DrawCounter = 0.0f;
+		}
+	}
+
+	if (bDrawWithoutStereo)
+	{
+		// Skip the stereo comps setup, we are just drawing to the texture
+		Super::Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	}
+	else
+	{
+		Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	}
+}
+
+void UVRStereoWidgetRenderComponent::BeginPlay()
+{
+	Super::BeginPlay();
+
+	if (WidgetClass.Get() != nullptr)
+	{
+		InitWidget();
+
+		IStereoLayers* StereoLayers;
+		if (!GetVisibleFlag() || (!bDrawWithoutStereo && (!GEngine->StereoRenderingDevice.IsValid() || (StereoLayers = GEngine->StereoRenderingDevice->GetStereoLayers()) == nullptr)))
+		{
+		}
+		else
+		{
+			// Initial render
+			RenderWidget(0.0f);
+		}
+	}
+}
+
+void UVRStereoWidgetRenderComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	Super::EndPlay(EndPlayReason);
+
+	ReleaseResources();
+}
+
+void UVRStereoWidgetRenderComponent::ReleaseResources()
+{
+
+#if !UE_SERVER
+	FWorldDelegates::LevelRemovedFromWorld.RemoveAll(this);
+#endif
+	if (Widget)
+	{
+		Widget = nullptr;
+	}
+
+	if (SlateWidget)
+	{
+		SlateWidget = nullptr;
+	}
+
+	if (WidgetRenderer)
+	{
+		BeginCleanup(WidgetRenderer);
+		WidgetRenderer = nullptr;
+	}
+
+	Texture = nullptr;
+
+	if (SlateWindow.IsValid())
+	{
+		if (/*!CanReceiveHardwareInput() && */FSlateApplication::IsInitialized())
+		{
+			FSlateApplication::Get().UnregisterVirtualWindow(SlateWindow.ToSharedRef());
+		}
+
+		SlateWindow.Reset();
+	}
+}
+
+void UVRStereoWidgetRenderComponent::DestroyComponent(bool bPromoteChildren/*= false*/)
+{
+	Super::DestroyComponent(bPromoteChildren);
+
+	ReleaseResources();
+}
+
+void UVRStereoWidgetRenderComponent::SetWidgetAndInit(TSubclassOf<UUserWidget> NewWidgetClass)
+{
+	WidgetClass = NewWidgetClass;
+	InitWidget();
+}
+
+void UVRStereoWidgetRenderComponent::OnLevelRemovedFromWorld(ULevel* InLevel, UWorld* InWorld)
+{
+	// If the InLevel is null, it's a signal that the entire world is about to disappear, so
+	// go ahead and remove this widget from the viewport, it could be holding onto too many
+	// dangerous actor references that won't carry over into the next world.
+	if (InLevel == nullptr && InWorld == GetWorld())
+	{
+		ReleaseResources();
+	}
+}
+
+void UVRStereoWidgetRenderComponent::InitWidget()
+{
+	if (IsTemplate())
+		return;
+
+#if !UE_SERVER
+	FWorldDelegates::LevelRemovedFromWorld.AddUObject(this, &ThisClass::OnLevelRemovedFromWorld);
+#endif
+	if (IsRunningDedicatedServer())
+		return;
+
+	if (Widget && Widget->GetClass() == WidgetClass)
+		return;
+
+	if (Widget != nullptr)
+	{
+		Widget->MarkPendingKill();
+		Widget = nullptr;
+	}
+
+	if (SlateWidget)
+	{
+		SlateWidget = nullptr;
+	}
+
+	// Don't do any work if Slate is not initialized
+	if (FSlateApplication::IsInitialized())
+	{
+		UWorld* World = GetWorld();
+
+		if (WidgetClass && Widget == nullptr && World && !World->bIsTearingDown)
+		{
+			Widget = CreateWidget(GetWorld(), WidgetClass);
+			Widget->SetRenderScale(FVector2D(1.0f, 1.0f));
+		}
+
+#if WITH_EDITOR
+		if (Widget && !World->IsGameWorld())// && !bEditTimeUsable)
+		{
+			if (!GEnableVREditorHacks)
+			{
+				// Prevent native ticking of editor component previews
+				Widget->SetDesignerFlags(EWidgetDesignFlags::Designing);
+			}
+		}
+#endif
+
+		if (Widget)
+		{
+			SlateWidget = Widget->TakeWidget();
+		}
+
+		// Create the SlateWindow if it doesn't exists
+		if (!SlateWindow.IsValid())
+		{
+			FVector2D DrawSize = this->GetQuadSize();
+			SlateWindow = SNew(SVirtualWindow).Size(DrawSize);
+			SlateWindow->SetIsFocusable(false);
+			SlateWindow->SetVisibility(EVisibility::Visible);
+			SlateWindow->SetContentScale(FVector2D(1.0f, 1.0f));
+
+			if (Widget && !Widget->IsDesignTime())
+			{
+				if (UWorld* LocalWorld = GetWorld())
+				{
+					if (LocalWorld->IsGameWorld())
+					{
+						UGameInstance* GameInstance = LocalWorld->GetGameInstance();
+						check(GameInstance);
+
+						UGameViewportClient* GameViewportClient = GameInstance->GetGameViewportClient();
+						if (GameViewportClient)
+						{
+							SlateWindow->AssignParentWidget(GameViewportClient->GetGameViewportWidget());
+						}
+					}
+				}
+			}
+
+		}
+
+		if (SlateWindow)
+		{
+			TSharedRef<SWidget> MyWidget = SlateWidget ? SlateWidget.ToSharedRef() : Widget->TakeWidget();
+			SlateWindow->SetContent(MyWidget);
+		}
+	}
+}
+
+void UVRStereoWidgetRenderComponent::RenderWidget(float DeltaTime)
+{
+	if (!Widget)
+		return;
+
+	if (WidgetRenderer == nullptr)
+	{
+		WidgetRenderer = new FWidgetRenderer(bUseGammaCorrection);
+		check(WidgetRenderer);
+	}
+
+	FVector2D DrawSize = this->GetQuadSize();
+	FVector2D TextureSize = DrawSize;
+
+	const int32 MaxAllowedDrawSize = GetMax2DTextureDimension();
+	if (DrawSize.X <= 0 || DrawSize.Y <= 0 || DrawSize.X > MaxAllowedDrawSize || DrawSize.Y > MaxAllowedDrawSize)
+	{
+		return;
+	}
+
+	TSharedRef<SWidget> MyWidget = SlateWidget ? SlateWidget.ToSharedRef() : Widget->TakeWidget();
+
+	if (bDrawAtDesiredSize)
+	{
+		SlateWindow->SlatePrepass(WidgetRenderScale);
+
+		FVector2D DesiredSize = SlateWindow->GetDesiredSize();
+		DesiredSize.X = FMath::RoundToInt(DesiredSize.X);
+		DesiredSize.Y = FMath::RoundToInt(DesiredSize.Y);
+
+		if (!DesiredSize.IsNearlyZero())
+		{
+			TextureSize = DesiredSize;// .IntPoint();
+
+			WidgetRenderer->SetIsPrepassNeeded(false);
+
+			if (SlateWindow->GetSizeInScreen() != DesiredSize)
+			{
+				SlateWindow->Resize(TextureSize);
+			}
+		}
+		else
+		{
+			WidgetRenderer->SetIsPrepassNeeded(true);
+		}
+	}
+	else
+	{
+		WidgetRenderer->SetIsPrepassNeeded(true);
+	}
+
+	if (RenderTarget == nullptr)
+	{
+		const EPixelFormat requestedFormat = FSlateApplication::Get().GetRenderer()->GetSlateRecommendedColorFormat();
+		RenderTarget = NewObject<UTextureRenderTarget2D>();
+		check(RenderTarget);
+		RenderTarget->AddToRoot();
+		RenderTarget->ClearColor = RenderTargetClearColor;
+		RenderTarget->TargetGamma = WidgetRenderGamma;
+		RenderTarget->InitCustomFormat(TextureSize.X, TextureSize.Y, requestedFormat /*PF_B8G8R8A8*/, false);
+		MarkStereoLayerDirty();
+	}
+	else if (RenderTarget->Resource->GetSizeX() != TextureSize.X || RenderTarget->Resource->GetSizeY() != TextureSize.Y)
+	{
+		const EPixelFormat requestedFormat = FSlateApplication::Get().GetRenderer()->GetSlateRecommendedColorFormat();
+		RenderTarget->InitCustomFormat(TextureSize.X, TextureSize.Y, requestedFormat /*PF_B8G8R8A8*/, false);
+		RenderTarget->UpdateResourceImmediate();
+		MarkStereoLayerDirty();
+	}
+
+	WidgetRenderer->DrawWidget(RenderTarget, MyWidget, WidgetRenderScale, TextureSize, DeltaTime);//DeltaTime);
+
+	if (Texture != RenderTarget)
+	{
+		Texture = RenderTarget;
+	}
 }
 
   //=============================================================================
@@ -51,7 +362,7 @@ UVRStereoWidgetComponent::UVRStereoWidgetComponent(const FObjectInitializer& Obj
 	//, StereoLayerQuadSize(FVector2D(500.0f, 500.0f))
 	, UVRect(FBox2D(FVector2D(0.0f, 0.0f), FVector2D(1.0f, 1.0f)))
 	//, CylinderRadius(100)
-	//, CylinderOverlayArc(100)
+	//, CylinderOverlayArc(100)EWidgetGeometryMode
 	//, CylinderHeight(50)
 	//, StereoLayerType(SLT_TrackerLocked)
 	//, StereoLayerShape(SLSH_QuadLayer)
@@ -71,6 +382,8 @@ UVRStereoWidgetComponent::UVRStereoWidgetComponent(const FObjectInitializer& Obj
 
 	bIsDirty = true;
 	bDirtyRenderTarget = false;
+	bRenderBothStereoAndWorld = false;
+	bDelayForRenderThread = false;
 	bIsSleeping = false;
 	//Texture = nullptr;
 }
@@ -105,7 +418,6 @@ void UVRStereoWidgetComponent::OnUnregister()
 	Super::OnUnregister();
 }
 
-
 void UVRStereoWidgetComponent::DrawWidgetToRenderTarget(float DeltaTime)
 {
 	Super::DrawWidgetToRenderTarget(DeltaTime);
@@ -121,14 +433,24 @@ void UVRStereoWidgetComponent::TickComponent(float DeltaTime, enum ELevelTick Ti
 
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	bool bIsVisible = IsVisible() && !bIsSleeping && ((GetWorld()->TimeSince(GetLastRenderTime()) <= 0.5f));
 
-	if (StereoWidgetCvars::ForceNoStereoWithVRWidgets)
+	//bool bIsCurVis = IsWidgetVisible();
+
+	bool bIsVisible = IsVisible() && IsWidgetVisible() && !bIsSleeping;// && ((GetWorld()->TimeSince(GetLastRenderTime()) <= 0.5f));
+
+	// If we are set to not use stereo layers or we don't have a valid stereo layer device
+	if (
+		StereoWidgetCvars::ForceNoStereoWithVRWidgets == 1 ||
+		!UVRExpansionFunctionLibrary::IsInVREditorPreviewOrGame() || 
+		!GEngine->StereoRenderingDevice.IsValid() || 
+		(GEngine->StereoRenderingDevice->GetStereoLayers() == nullptr)
+		)
 	{
 		if (!bShouldCreateProxy)
 		{
 			bShouldCreateProxy = true;
-			MarkRenderStateDirty(); // Recreate
+			//MarkRenderStateDirty(); // Recreate
+
 			if (LayerId)
 			{
 				if (GEngine->StereoRenderingDevice.IsValid())
@@ -143,26 +465,15 @@ void UVRStereoWidgetComponent::TickComponent(float DeltaTime, enum ELevelTick Ti
 
 		return;
 	}
-
-	if (!UVRExpansionFunctionLibrary::IsInVREditorPreviewOrGame() || !GEngine->StereoRenderingDevice.IsValid() || (GEngine->StereoRenderingDevice->GetStereoLayers() == nullptr))
+	else if (bRenderBothStereoAndWorld || StereoWidgetCvars::ForceNoStereoWithVRWidgets == 2) // Forcing both modes at once
 	{
 		if (!bShouldCreateProxy)
 		{
 			bShouldCreateProxy = true;
 			MarkRenderStateDirty(); // Recreate
-			if (LayerId)	
-			{
-				if (GEngine->StereoRenderingDevice.IsValid())
-				{
-					IStereoLayers* StereoLayers = GEngine->StereoRenderingDevice->GetStereoLayers();
-					if (StereoLayers)
-						StereoLayers->DestroyLayer(LayerId);
-				}
-				LayerId = 0;
-			}
 		}
 	}
-	else
+	else // Stereo only
 	{
 		if (bShouldCreateProxy)
 		{
@@ -174,7 +485,7 @@ void UVRStereoWidgetComponent::TickComponent(float DeltaTime, enum ELevelTick Ti
 #if !UE_SERVER
 
 	// Same check that the widget runs prior to ticking
-	if (IsRunningDedicatedServer() || (Widget == nullptr && !SlateWidget.IsValid()))
+	if (IsRunningDedicatedServer() || !GetSlateWindow() || GetSlateWindow()->GetContent() == SNullWidget::NullWidget)
 	{
 		return;
 	}
@@ -229,8 +540,33 @@ void UVRStereoWidgetComponent::TickComponent(float DeltaTime, enum ELevelTick Ti
 				{
 					// Set transform to this relative transform
 
-					Transform = GetComponentTransform().GetRelativeTransform(mpawn->GetTransform());
-					Transform = FTransform(FRotator(0.f, -180.f, 0.f)) * Transform;
+
+					bool bHandledTransform = false;
+					if (AVRBaseCharacter* BaseVRChar = Cast<AVRBaseCharacter>(mpawn))
+					{
+						if (USceneComponent* CameraParent = BaseVRChar->VRReplicatedCamera->GetAttachParent())
+						{
+							Transform = GetComponentTransform().GetRelativeTransform(CameraParent->GetComponentTransform());
+							Transform = FTransform(FRotator(0.f, -180.f, 0.f)) * Transform;
+							bHandledTransform = true;
+						}
+					}
+					else if (UCameraComponent* Camera = mpawn->FindComponentByClass<UCameraComponent>())
+					{
+						// Look for generic camera comp and use its attach parent
+						if (USceneComponent* CameraParent = Camera->GetAttachParent())
+						{
+							Transform = GetComponentTransform().GetRelativeTransform(CameraParent->GetComponentTransform());
+							Transform = FTransform(FRotator(0.f, -180.f, 0.f)) * Transform;
+							bHandledTransform = true;							
+						}
+					}
+
+					if(!bHandledTransform) // Just use the pawn as we don't know the heirarchy
+					{
+						Transform = GetComponentTransform().GetRelativeTransform(mpawn->GetTransform());
+						Transform = FTransform(FRotator(0.f, -180.f, 0.f)) * Transform;
+					}
 					
 					// OpenVR y+ Up, +x Right, -z Going away
 					// UE4 z+ up, +y right, +x forward
@@ -285,8 +621,15 @@ void UVRStereoWidgetComponent::TickComponent(float DeltaTime, enum ELevelTick Ti
 		LayerDsec.Priority = Priority;
 		LayerDsec.QuadSize = FVector2D(DrawSize);
 		LayerDsec.UVRect = UVRect;
-		LayerDsec.Transform = Transform;
 
+		if (bDelayForRenderThread && !LastTransform.Equals(FTransform::Identity))
+		{
+			LayerDsec.Transform = LastTransform;
+		}
+		else
+		{
+			LayerDsec.Transform = Transform;
+		}
 
 		if (RenderTarget)
 		{
@@ -298,16 +641,6 @@ void UVRStereoWidgetComponent::TickComponent(float DeltaTime, enum ELevelTick Ti
 		//{
 		//	LayerDsec.LeftTexture = LeftTexture->Resource->TextureRHI;
 		//}
-
-		const float ArcAngleRadians = FMath::DegreesToRadians(CylinderArcAngle);
-		const float Radius = GetDrawSize().X / ArcAngleRadians;
-
-		//LayerDsec.CylinderSize = FVector2D(/*CylinderRadius*/Radius, /*CylinderOverlayArc*/CylinderArcAngle);
-		LayerDsec.CylinderRadius = Radius;
-		LayerDsec.CylinderOverlayArc = CylinderArcAngle;
-
-		// This needs to be auto set from variables, need to work on it
-		LayerDsec.CylinderHeight = GetDrawSize().Y;//CylinderHeight;
 
 		LayerDsec.Flags |= IStereoLayers::LAYER_FLAG_TEX_CONTINUOUS_UPDATE;// (/*bLiveTexture*/true) ? IStereoLayers::LAYER_FLAG_TEX_CONTINUOUS_UPDATE : 0;
 		LayerDsec.Flags |= (bNoAlphaChannel) ? IStereoLayers::LAYER_FLAG_TEX_NO_ALPHA_CHANNEL : 0;
@@ -339,14 +672,52 @@ void UVRStereoWidgetComponent::TickComponent(float DeltaTime, enum ELevelTick Ti
 		{
 		case EWidgetGeometryMode::Cylinder:
 		{
-			LayerDsec.ShapeType = IStereoLayers::CylinderLayer;
+			UStereoLayerShapeCylinder* Cylinder = Cast<UStereoLayerShapeCylinder>(Shape);
+
+			if (!Cylinder)
+			{
+				if (Shape)
+				{
+					Shape->MarkPendingKill();
+				}
+
+				Cylinder = NewObject<UStereoLayerShapeCylinder>(this, NAME_None, RF_Public);
+				Shape = Cylinder;
+			}
+
+			if (Cylinder)
+			{
+				const float ArcAngleRadians = FMath::DegreesToRadians(CylinderArcAngle);
+				const float Radius = GetDrawSize().X / ArcAngleRadians;
+
+				Cylinder->Height = GetDrawSize().Y;//CylinderHeight_DEPRECATED;
+				Cylinder->OverlayArc = CylinderArcAngle;// CylinderOverlayArc_DEPRECATED;
+				Cylinder->Radius = Radius;// CylinderRadius_DEPRECATED;
+			}
+			break;
+
+			//LayerDsec.ShapeType = IStereoLayers::CylinderLayer;
+
 		}break;
 		case EWidgetGeometryMode::Plane:
 		default:
 		{
-			LayerDsec.ShapeType = IStereoLayers::QuadLayer;
+			UStereoLayerShapeQuad* Quad = Cast<UStereoLayerShapeQuad>(Shape);
+
+			if (!Quad)
+			{
+				if (Shape)
+				{
+					Shape->MarkPendingKill();
+				}
+				Shape = NewObject<UStereoLayerShapeQuad>(this, NAME_None, RF_Public);
+			}
+			//LayerDsec.ShapeType = IStereoLayers::QuadLayer;
 		}break;
 		}
+
+		if(Shape)
+			Shape->ApplyShape(LayerDsec);
 
 		if (LayerId)
 		{
@@ -642,7 +1013,7 @@ public:
 		Result.bShadowRelevance = IsShadowCast(View);
 		Result.bTranslucentSelfShadow = bCastVolumetricTranslucentShadow;
 		Result.bEditorPrimitiveRelevance = false;
-		Result.bVelocityRelevance = IsMovable() && Result.bOpaqueRelevance && Result.bRenderInMainPass;
+		Result.bVelocityRelevance = IsMovable() && Result.bOpaque && Result.bRenderInMainPass;
 
 		return Result;
 	}
@@ -691,7 +1062,7 @@ FPrimitiveSceneProxy* UVRStereoWidgetComponent::CreateSceneProxy()
 		return nullptr;
 	}
 
-	if (WidgetRenderer && CurrentSlateWidget.IsValid())
+	if (WidgetRenderer && GetSlateWindow() && GetSlateWindow()->GetContent() != SNullWidget::NullWidget)
 	{
 		RequestRedraw();
 		LastWidgetRenderTime = 0;

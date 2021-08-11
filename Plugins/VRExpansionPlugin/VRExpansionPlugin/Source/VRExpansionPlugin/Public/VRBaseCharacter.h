@@ -13,11 +13,15 @@
 #include "Components/CapsuleComponent.h"
 #include "VRBaseCharacter.generated.h"
 
+class AVRPlayerController;
+
 DECLARE_LOG_CATEGORY_EXTERN(LogBaseVRCharacter, Log, All);
 
 /** Delegate for notification when the lever state changes. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVRSeatThresholdChangedSignature, bool, bIsWithinThreshold, float, ToThresholdScaler);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVRPlayerStateReplicatedSignature, const APlayerState *, NewPlayerState);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVRPlayerTeleportedSignature);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVRPlayerNetworkCorrectedSignature);
 
 USTRUCT()
 struct VREXPANSIONPLUGIN_API FRepMovementVRCharacter : public FRepMovement
@@ -28,6 +32,9 @@ struct VREXPANSIONPLUGIN_API FRepMovementVRCharacter : public FRepMovement
 		bool bJustTeleported;
 
 	UPROPERTY(Transient)
+		bool bJustTeleportedGrips;
+
+	UPROPERTY(Transient)
 		AActor* Owner;
 
 	bool NetSerialize(FArchive& Ar, class UPackageMap* Map, bool& bOutSuccess)
@@ -35,11 +42,12 @@ struct VREXPANSIONPLUGIN_API FRepMovementVRCharacter : public FRepMovement
 		FRepMovement BaseSettings = Owner ? Owner->GetReplicatedMovement() : FRepMovement();
 
 		// pack bitfield with flags
-		uint8 Flags = (bSimulatedPhysicSleep << 0) | (bRepPhysics << 1) | (bJustTeleported << 2);
-		Ar.SerializeBits(&Flags, 3);
+		uint8 Flags = (bSimulatedPhysicSleep << 0) | (bRepPhysics << 1) | (bJustTeleported << 2) | (bJustTeleportedGrips << 3);
+		Ar.SerializeBits(&Flags, 4);
 		bSimulatedPhysicSleep = (Flags & (1 << 0)) ? 1 : 0;
 		bRepPhysics = (Flags & (1 << 1)) ? 1 : 0;
 		bJustTeleported = (Flags & (1 << 2)) ? 1 : 0;
+		bJustTeleportedGrips = (Flags & (1 << 3)) ? 1 : 0;
 
 		bOutSuccess = true;
 
@@ -234,6 +242,15 @@ class VREXPANSIONPLUGIN_API AVRBaseCharacter : public ACharacter
 public:
 	AVRBaseCharacter(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
+	/** BaseVR Character movement component belongs to */
+	UPROPERTY(Transient, DuplicateTransient)
+		AVRPlayerController* OwningVRPlayerController;
+
+	virtual void CacheInitialMeshOffset(FVector MeshRelativeLocation, FRotator MeshRelativeRotation) override;
+	virtual void PostInitializeComponents() override;
+
+	virtual void PossessedBy(AController* NewController);
+	virtual void OnRep_Controller() override;
 	virtual void OnRep_PlayerState() override;
 
 	/** Used for replication of our RootComponent's position and velocity */
@@ -241,13 +258,22 @@ public:
 		struct FRepMovementVRCharacter ReplicatedMovementVR;
 
 	bool bFlagTeleported;
+	bool bFlagTeleportedGrips;
 
 	// Injecting our custom teleport notification
 	virtual void OnRep_ReplicatedMovement() override;
 	virtual void GatherCurrentMovement() override;
 
+	// Give my users direct access to an event for when the player has teleported
+	UPROPERTY(BlueprintAssignable, Category = "VRMovement")
+		FVRPlayerTeleportedSignature OnCharacterTeleported_Bind;
+
+	// Give my users direct access to an event for when the player has been network corrected
+	UPROPERTY(BlueprintAssignable, Category = "VRMovement")
+		FVRPlayerNetworkCorrectedSignature OnCharacterNetworkCorrected_Bind;
+
 	// Give my users direct access to an event for when the player state has changed
-	UPROPERTY(BlueprintAssignable, Category = "BaseVRCharacter")
+	UPROPERTY(BlueprintAssignable, Category = "VRMovement")
 		FVRPlayerStateReplicatedSignature OnPlayerStateReplicated_Bind;
 
 	//These functions are now housed in the base character and used when possible, it saves about 7 bits of packet header overhead per send.
@@ -289,9 +315,9 @@ public:
 
 	// Override this in c++ or blueprints to pass in an IK mesh to be used in some optimizations
 	// May be extended in the future
-	UFUNCTION(BlueprintNativeEvent, Category = "BaseVRCharacter")
-	USkeletalMeshComponent * GetIKMesh() const;
-	virtual USkeletalMeshComponent *  GetIKMesh_Implementation() const;
+	//UFUNCTION(BlueprintNativeEvent, Category = "BaseVRCharacter")
+	//USkeletalMeshComponent * GetIKMesh() const;
+	//virtual USkeletalMeshComponent *  GetIKMesh_Implementation() const;1
 	// #TODO: Work with the above, can do multiple things with it
 
 
@@ -382,22 +408,22 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "VRBaseCharacter")
 		bool bUseExperimentalUnseatModeFix;
 
-	UPROPERTY(BlueprintReadOnly, Replicated, EditAnywhere, Category = "BaseVRCharacter|Seating", ReplicatedUsing = OnRep_SeatedCharInfo)
+	UPROPERTY(BlueprintReadOnly, Replicated, EditAnywhere, Category = "Seating", ReplicatedUsing = OnRep_SeatedCharInfo)
 	FVRSeatedCharacterInfo SeatInformation;
 
 	// Called when the seated mode is changed
-	UFUNCTION(BlueprintNativeEvent, Category = "BaseVRCharacter")
+	UFUNCTION(BlueprintNativeEvent, Category = "Seating")
 		void OnSeatedModeChanged(bool bNewSeatedMode, bool bWasAlreadySeated);
 	virtual void OnSeatedModeChanged_Implementation(bool bNewSeatedMode, bool bWasAlreadySeated) {}
 
 	// Called when the the player either transitions to/from the threshold boundry or the scaler value of being outside the boundry changes
 	// Can be used for warnings or screen darkening, ect
-	UFUNCTION(BlueprintNativeEvent, Category = "BaseVRCharacter")
+	UFUNCTION(BlueprintNativeEvent, Category = "Seating")
 		void OnSeatThreshholdChanged(bool bIsWithinThreshold, float ToThresholdScaler);
 	virtual void OnSeatThreshholdChanged_Implementation(bool bIsWithinThreshold, float ToThresholdScaler) {}
 	
 	// Call to use an object
-	UPROPERTY(BlueprintAssignable, Category = "BaseVRCharacter")
+	UPROPERTY(BlueprintAssignable, Category = "Seating")
 		FVRSeatThresholdChangedSignature OnSeatThreshholdChanged_Bind;
 	
 	void ZeroToSeatInformation()
@@ -431,6 +457,7 @@ public:
 
 	// Sets seated mode on the character and then fires off an event to handle any special setup
 	// Should only be called on the server / net authority
+	// If allowed radius is 0.0f then the seated mode does not check for radial distance anymore.
 	bool SetSeatedMode(USceneComponent * SeatParent, bool bSetSeatedMode, FTransform TargetTransform, FTransform InitialRelCameraTransform, float AllowedRadius = 40.0f, float AllowedRadiusThreshold = 20.0f, bool bZeroToHead = true, EVRConjoinedMovementModes PostSeatedMovementMode = EVRConjoinedMovementModes::C_MOVE_Walking);
 
 	void SetSeatRelativeLocationAndRotationVR(FVector LocDelta);
@@ -509,7 +536,7 @@ public:
 	// When called server side will automatically apply to remote clients as well.
 	// Owning clients get it on server correction automatically already.
 	UFUNCTION(BlueprintCallable, Category = "VRGrip")
-		virtual void NotifyOfTeleport();
+		virtual void NotifyOfTeleport(bool bRegisterAsTeleport = true);
 
 
 	// Event triggered when a move action is performed, this is ran just prior to PerformMovement in the character tick
@@ -530,7 +557,7 @@ public:
 	virtual void OnEndWallPushback_Implementation();
 
 	// Event when a navigation pathing operation has completed, auto calls stop movement for VR characters
-	UFUNCTION(BlueprintImplementableEvent, Category = "VRBaseCharacter")
+	UFUNCTION(BlueprintImplementableEvent, Category = "VRBaseCharacter|Navigation")
 		void ReceiveNavigationMoveCompleted(EPathFollowingResult::Type PathingResult);
 
 	virtual void NavigationMoveCompleted(FAIRequestID RequestID, const FPathFollowingResult& Result)
@@ -539,7 +566,7 @@ public:
 		ReceiveNavigationMoveCompleted(Result.Code);
 	}
 
-	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter")
+	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter|Navigation")
 	EPathFollowingStatus::Type GetMoveStatus() const
 	{
 		if (!Controller)
@@ -554,7 +581,7 @@ public:
 	}
 
 	/** Returns true if the current PathFollowingComponent's path is partial (does not reach desired destination). */
-	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter")
+	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter|Navigation")
 	bool HasPartialPath() const
 	{
 		if (!Controller)
@@ -569,7 +596,7 @@ public:
 	}
 
 	// Instantly stops pathing
-	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter")
+	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter|Navigation")
 	void StopNavigationMovement()
 	{
 		if (!Controller)
@@ -587,9 +614,14 @@ public:
 		TSubclassOf<UNavigationQueryFilter> DefaultNavigationFilterClass;
 
 	// An extended simple move to location with additional parameters
-	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter", Meta = (AdvancedDisplay = "bStopOnOverlap,bCanStrafe,bAllowPartialPath"))
+	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter|Navigation", Meta = (AdvancedDisplay = "bStopOnOverlap,bCanStrafe,bAllowPartialPath"))
 		virtual void ExtendedSimpleMoveToLocation(const FVector& GoalLocation, float AcceptanceRadius = -1, bool bStopOnOverlap = false,
 			bool bUsePathfinding = true, bool bProjectDestinationToNavigation = true, bool bCanStrafe = false,
 			TSubclassOf<UNavigationQueryFilter> FilterClass = NULL, bool bAllowPartialPath = true);
+
+	// Returns the current path points on the active navigation path
+	// Will return false / an empty result if the path following component is not active yet or the path is empty
+	UFUNCTION(BlueprintCallable, Category = "VRBaseCharacter|Navigation")
+		bool GetCurrentNavigationPathPoints(TArray<FVector>& NavigationPointList);
 
 };

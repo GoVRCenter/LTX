@@ -1,6 +1,7 @@
 // Copyright 1998-2016 Epic Games, Inc. All Rights Reserved.
 
 #include "Interactibles/VRSliderComponent.h"
+#include "VRExpansionFunctionLibrary.h"
 #include "Net/UnrealNetwork.h"
 
   //=============================================================================
@@ -22,6 +23,9 @@ UVRSliderComponent::UVRSliderComponent(const FObjectInitializer& ObjectInitializ
 	InitialRelativeTransform = FTransform::Identity;
 	bDenyGripping = false;
 
+	bUpdateInTick = false;
+	bPassThrough = false;
+
 	MinSlideDistance = FVector::ZeroVector;
 	MaxSlideDistance = FVector(10.0f, 0.f, 0.f);
 	SliderRestitution = 0.0f;
@@ -37,6 +41,9 @@ UVRSliderComponent::UVRSliderComponent(const FObjectInitializer& ObjectInitializ
 	InitialGripLoc = FVector::ZeroVector;
 
 	bSlideDistanceIsInParentSpace = true;
+	bUseLegacyLogic = false;
+	bIsLocked = false;
+	bAutoDropWhenLocked = true;
 
 	SplineComponentToFollow = nullptr;
 
@@ -44,6 +51,8 @@ UVRSliderComponent::UVRSliderComponent(const FObjectInitializer& ObjectInitializ
 	SplineLerpType = EVRInteractibleSliderLerpType::Lerp_None;
 	SplineLerpValue = 8.f;
 
+	PrimarySlotRange = 100.f;
+	SecondarySlotRange = 100.f;
 	GripPriority = 1;
 	LastSliderProgressState = -1.0f;
 	LastInputKey = 0.0f;
@@ -51,6 +60,7 @@ UVRSliderComponent::UVRSliderComponent(const FObjectInitializer& ObjectInitializ
 	bSliderUsesSnapPoints = false;
 	SnapIncrement = 0.1f;
 	SnapThreshold = 0.1f;
+	bIncrementProgressBetweenSnapPoints = false;
 	EventThrowThreshold = 1.0f;
 	bHitEventThreshold = false;
 
@@ -88,11 +98,9 @@ void UVRSliderComponent::PreReplication(IRepChangedPropertyTracker & ChangedProp
 	// Don't replicate if set to not do it
 	DOREPLIFETIME_ACTIVE_OVERRIDE(UVRSliderComponent, GameplayTags, bRepGameplayTags);
 
-	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeLocation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeRotation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeScale3D, bReplicateMovement);
-	PRAGMA_ENABLE_DEPRECATION_WARNINGS
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeLocation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeRotation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeScale3D, bReplicateMovement);
 }
 
 void UVRSliderComponent::OnRegister()
@@ -125,6 +133,34 @@ void UVRSliderComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 	// Call supers tick (though I don't think any of the base classes to this actually implement it)
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
+	if (bIsHeld && bUpdateInTick && HoldingGrip.HoldingController)
+	{
+		FBPActorGripInformation GripInfo;
+		EBPVRResultSwitch Result;
+		HoldingGrip.HoldingController->GetGripByID(GripInfo, HoldingGrip.GripID, Result);
+
+		if (Result == EBPVRResultSwitch::OnSucceeded)
+		{
+			bPassThrough = true;
+			TickGrip_Implementation(HoldingGrip.HoldingController, GripInfo, DeltaTime);
+			bPassThrough = false;
+		}
+		return;
+	}
+
+	// If we are locked then end the lerp, no point
+	if (bIsLocked)
+	{
+		// Notify the end user
+		OnSliderFinishedLerping.Broadcast(CurrentSliderProgress);
+		ReceiveSliderFinishedLerping(CurrentSliderProgress);
+
+		this->SetComponentTickEnabled(false);
+		bReplicateMovement = bOriginalReplicatesMovement;
+
+		return;
+	}
+
 	if (bIsLerping)
 	{
 		if (FMath::IsNearlyZero(MomentumAtDrop * DeltaTime, 0.00001f))
@@ -134,7 +170,6 @@ void UVRSliderComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 		else
 		{
 			MomentumAtDrop = FMath::FInterpTo(MomentumAtDrop, 0.0f, DeltaTime, SliderMomentumFriction);
-
 			float newProgress = CurrentSliderProgress + (MomentumAtDrop * DeltaTime);
 
 			if (newProgress < 0.0f || FMath::IsNearlyEqual(newProgress, 0.0f, 0.00001f))
@@ -188,6 +223,23 @@ void UVRSliderComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 
 void UVRSliderComponent::TickGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation, float DeltaTime) 
 {
+
+	// Skip this tick if its not triggered from the pass through
+	if (bUpdateInTick && !bPassThrough)
+		return;
+
+	// If the sliders progress is locked then just exit early
+	if (bIsLocked)
+	{
+		if (bAutoDropWhenLocked)
+		{
+			// Check if we should auto drop
+			CheckAutoDrop(GrippingController, GripInformation);
+		}
+
+		return;
+	}
+
 	// Handle manual tracking here
 	FTransform ParentTransform = UVRInteractibleFunctionLibrary::Interactible_GetCurrentParentTransform(this);
 	FTransform CurrentRelativeTransform = InitialRelativeTransform * ParentTransform;
@@ -300,12 +352,20 @@ void UVRSliderComponent::TickGrip_Implementation(UGripMotionControllerComponent 
 
 	CheckSliderProgress();
 
+	// Check if we should auto drop
+	CheckAutoDrop(GrippingController, GripInformation);
+}
+
+bool UVRSliderComponent::CheckAutoDrop(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation)
+{
 	// Converted to a relative value now so it should be correct
 	if (BreakDistance > 0.f && GrippingController->HasGripAuthority(GripInformation) && FVector::DistSquared(InitialDropLocation, this->GetComponentTransform().InverseTransformPosition(GrippingController->GetPivotLocation())) >= FMath::Square(BreakDistance))
 	{
 		GrippingController->DropObjectByInterface(this, HoldingGrip.GripID);
-		return;
+		return true;
 	}
+
+	return false;
 }
 
 void UVRSliderComponent::CheckSliderProgress()
@@ -366,6 +426,12 @@ void UVRSliderComponent::OnGrip_Implementation(UGripMotionControllerComponent * 
 	{
 		bReplicateMovement = false;
 	}
+
+	if (bUpdateInTick)
+		SetComponentTickEnabled(true);
+
+	OnGripped.Broadcast(GrippingController, GripInformation);
+
 }
 
 void UVRSliderComponent::OnGripRelease_Implementation(UGripMotionControllerComponent * ReleasingController, const FBPActorGripInformation & GripInformation, bool bWasSocketed) 
@@ -385,6 +451,18 @@ void UVRSliderComponent::OnGripRelease_Implementation(UGripMotionControllerCompo
 		this->SetComponentTickEnabled(false);
 		bReplicateMovement = bOriginalReplicatesMovement;
 	}
+
+	OnDropped.Broadcast(ReleasingController, GripInformation, bWasSocketed);
+}
+
+void UVRSliderComponent::SetIsLocked(bool bNewLockedState)
+{
+	bIsLocked = bNewLockedState;
+}
+
+void UVRSliderComponent::SetGripPriority(int NewGripPriority)
+{
+	GripPriority = NewGripPriority;
 }
 
 void UVRSliderComponent::OnChildGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation) {}
@@ -398,7 +476,7 @@ void UVRSliderComponent::OnEndSecondaryUsed_Implementation() {}
 void UVRSliderComponent::OnInput_Implementation(FKey Key, EInputEvent KeyEvent) {}
 bool UVRSliderComponent::RequestsSocketing_Implementation(USceneComponent *& ParentToSocketTo, FName & OptionalSocketName, FTransform_NetQuantize & RelativeTransform) { return false; }
 
-bool UVRSliderComponent::DenyGripping_Implementation()
+bool UVRSliderComponent::DenyGripping_Implementation(UGripMotionControllerComponent * GripInitiator)
 {
 	return bDenyGripping;
 }
@@ -479,9 +557,12 @@ void UVRSliderComponent::ClosestPrimarySlotInRange_Implementation(FVector WorldL
 	bHadSlotInRange = false;
 }*/
 
-void UVRSliderComponent::ClosestGripSlotInRange_Implementation(FVector WorldLocation, bool bSecondarySlot, bool & bHadSlotInRange, FTransform & SlotWorldTransform, UGripMotionControllerComponent * CallingController, FName OverridePrefix)
+void UVRSliderComponent::ClosestGripSlotInRange_Implementation(FVector WorldLocation, bool bSecondarySlot, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent * CallingController, FName OverridePrefix)
 {
-	bHadSlotInRange = false;
+	if (OverridePrefix.IsNone())
+		bSecondarySlot ? OverridePrefix = "VRGripS" : OverridePrefix = "VRGripP";
+
+	UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName_Component(OverridePrefix, this, WorldLocation, bSecondarySlot ? SecondarySlotRange : PrimarySlotRange, bHadSlotInRange, SlotWorldTransform, SlotName, CallingController);
 }
 
 bool UVRSliderComponent::AllowsMultipleGrips_Implementation()
@@ -544,9 +625,9 @@ FVector UVRSliderComponent::ClampSlideVector(FVector ValueToClamp)
 	if (bSlideDistanceIsInParentSpace)
 		fScaleFactor = fScaleFactor / InitialRelativeTransform.GetScale3D();
 
-	FVector MinScale = MinSlideDistance * fScaleFactor;
+	FVector MinScale = (bUseLegacyLogic ? MinSlideDistance : MinSlideDistance.GetAbs()) * fScaleFactor;
 
-	FVector Dist = (MinSlideDistance + MaxSlideDistance) * fScaleFactor;
+	FVector Dist = (bUseLegacyLogic ? (MinSlideDistance + MaxSlideDistance) : (MinSlideDistance.GetAbs() + MaxSlideDistance.GetAbs())) * fScaleFactor;
 	FVector Progress = (ValueToClamp - (-MinScale)) / Dist;
 
 	if (bSliderUsesSnapPoints)
@@ -565,6 +646,33 @@ FVector UVRSliderComponent::ClampSlideVector(FVector ValueToClamp)
 	return (Progress * Dist) - (MinScale);
 }
 
+float UVRSliderComponent::GetDistanceAlongSplineAtSplineInputKey(float InKey) const
+{
+
+	const int32 NumPoints = SplineComponentToFollow->SplineCurves.Position.Points.Num();
+	const int32 NumSegments = SplineComponentToFollow->IsClosedLoop() ? NumPoints : NumPoints - 1;
+
+	if ((InKey >= 0) && (InKey < NumSegments))
+	{
+		const int32 ReparamPrevIndex = static_cast<int32>(InKey * SplineComponentToFollow->ReparamStepsPerSegment);
+		const int32 ReparamNextIndex = ReparamPrevIndex + 1;
+
+		const float Alpha = (InKey * SplineComponentToFollow->ReparamStepsPerSegment) - static_cast<float>(ReparamPrevIndex);
+
+		const float PrevDistance = SplineComponentToFollow->SplineCurves.ReparamTable.Points[ReparamPrevIndex].InVal;
+		const float NextDistance = SplineComponentToFollow->SplineCurves.ReparamTable.Points[ReparamNextIndex].InVal;
+
+		// ReparamTable assumes that distance and input keys have a linear relationship in-between entries.
+		return FMath::Lerp(PrevDistance, NextDistance, Alpha);
+	}
+	else if (InKey >= NumSegments)
+	{
+		return SplineComponentToFollow->SplineCurves.GetSplineLength();
+	}
+
+	return 0.0f;
+}
+
 float UVRSliderComponent::GetCurrentSliderProgress(FVector CurLocation, bool bUseKeyInstead, float CurKey)
 {
 	if (SplineComponentToFollow != nullptr)
@@ -575,17 +683,42 @@ float UVRSliderComponent::GetCurrentSliderProgress(FVector CurLocation, bool bUs
 		if (!bUseKeyInstead)
 			ClosestKey = SplineComponentToFollow->FindInputKeyClosestToWorldLocation(CurLocation);
 
-		int32 primaryKey = FMath::TruncToInt(ClosestKey);
+		/*int32 primaryKey = FMath::TruncToInt(ClosestKey);
 
 		float distance1 = SplineComponentToFollow->GetDistanceAlongSplineAtSplinePoint(primaryKey);
 		float distance2 = SplineComponentToFollow->GetDistanceAlongSplineAtSplinePoint(primaryKey + 1);
 
 		float FinalDistance = ((distance2 - distance1) * (ClosestKey - (float)primaryKey)) + distance1;
-		return FMath::Clamp(FinalDistance / SplineComponentToFollow->GetSplineLength(), 0.0f, 1.0f);
+		return FMath::Clamp(FinalDistance / SplineComponentToFollow->GetSplineLength(), 0.0f, 1.0f);*/
+		float SplineLength = SplineComponentToFollow->GetSplineLength();
+		return GetDistanceAlongSplineAtSplineInputKey(ClosestKey) / SplineLength;
 	}
 
 	// Should need the clamp normally, but if someone is manually setting locations it could go out of bounds
-	return FMath::Clamp(FVector::Dist(-MinSlideDistance, CurLocation) / FVector::Dist(-MinSlideDistance, MaxSlideDistance), 0.0f, 1.0f);
+	float Progress = 0.f;
+	
+	if (bUseLegacyLogic)
+	{
+		Progress = FMath::Clamp(FVector::Dist(-MinSlideDistance, CurLocation) / FVector::Dist(-MinSlideDistance, MaxSlideDistance), 0.0f, 1.0f);
+	}
+	else
+	{
+		Progress = FMath::Clamp(FVector::Dist(-MinSlideDistance.GetAbs(), CurLocation) / FVector::Dist(-MinSlideDistance.GetAbs(), MaxSlideDistance.GetAbs()), 0.0f, 1.0f);
+	}
+
+	if (bSliderUsesSnapPoints && SnapThreshold < SnapIncrement)
+	{
+		if (FMath::Fmod(Progress, SnapIncrement) < SnapThreshold)
+		{
+			Progress = FMath::GridSnap(Progress, SnapIncrement);
+		}
+		else if(!bIncrementProgressBetweenSnapPoints)
+		{
+			Progress = CurrentSliderProgress;
+		}
+	}
+	
+	return Progress;
 }
 
 void UVRSliderComponent::GetLerpedKey(float &ClosestKey, float DeltaTime)
@@ -670,7 +803,7 @@ void UVRSliderComponent::SetSliderProgress(float NewSliderProgress)
 	else // Not a spline follow
 	{
 		// Doing it min+max because the clamp value subtracts the min value
-		FVector CalculatedLocation = FMath::Lerp(-MinSlideDistance, MaxSlideDistance, NewSliderProgress);
+		FVector CalculatedLocation = bUseLegacyLogic ? FMath::Lerp(-MinSlideDistance, MaxSlideDistance, NewSliderProgress) : FMath::Lerp(-MinSlideDistance.GetAbs(), MaxSlideDistance.GetAbs(), NewSliderProgress);
 
 		if (bSlideDistanceIsInParentSpace)
 			CalculatedLocation *= FVector(1.0f) / InitialRelativeTransform.GetScale3D();
@@ -698,10 +831,7 @@ float UVRSliderComponent::CalculateSliderProgress()
 		FTransform CurrentRelativeTransform = InitialRelativeTransform * ParentTransform;
 		FVector CalculatedLocation = CurrentRelativeTransform.InverseTransformPosition(this->GetComponentLocation());
 
-		//if (bSlideDistanceIsInParentSpace)
-			//CalculatedLocation *= FVector(1.0f) / InitialRelativeTransform.GetScale3D();
-
-		CurrentSliderProgress = GetCurrentSliderProgress(CalculatedLocation);
+		CurrentSliderProgress = GetCurrentSliderProgress(bSlideDistanceIsInParentSpace ? CalculatedLocation * InitialRelativeTransform.GetScale3D() : CalculatedLocation);
 	}
 
 	return CurrentSliderProgress;

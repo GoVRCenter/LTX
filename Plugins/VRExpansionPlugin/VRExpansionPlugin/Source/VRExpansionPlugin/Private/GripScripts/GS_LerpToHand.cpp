@@ -26,7 +26,17 @@ UGS_LerpToHand::UGS_LerpToHand(const FObjectInitializer& ObjectInitializer) :
 //void UGS_InteractibleSettings::BeginPlay_Implementation() {}
 void UGS_LerpToHand::OnGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation) 
 {
-	OnGripTransform = GetParentTransform();
+	const UVRGlobalSettings& VRSettings = *GetDefault<UVRGlobalSettings>();
+
+	// Dont run if the global lerping is enabled
+	if (VRSettings.bUseGlobalLerpToHand)
+	{
+		bIsActive = false;
+		return;
+	}
+
+	OnGripTransform = GetParentTransform(true, GripInformation.GrippedBoneName);
+	UObject* ParentObj = this->GetParent();
 
 	FTransform TargetTransform = GripInformation.RelativeTransform * GrippingController->GetPivotTransform();
 	float Distance = FVector::Dist(OnGripTransform.GetLocation(), TargetTransform.GetLocation());
@@ -55,6 +65,8 @@ void UGS_LerpToHand::OnGrip_Implementation(UGripMotionControllerComponent * Grip
 
 		// Get the modified lerp speed
 		LerpSpeed = ((1.f / LerpDuration) * LerpScaler);
+
+		OnLerpToHandBegin.Broadcast();
 	}
 
 
@@ -93,9 +105,9 @@ bool UGS_LerpToHand::GetWorldTransform_Implementation
 
 	float Alpha = 0.0f; 
 
-
-	Alpha = FMath::Clamp(CurrentLerpTime, 0.f, 1.0f);
 	CurrentLerpTime += DeltaTime * LerpSpeed;
+	float OrigAlpha = FMath::Clamp(CurrentLerpTime, 0.f, 1.0f);
+	Alpha = OrigAlpha;
 
 	if (bUseCurve)
 	{
@@ -148,7 +160,7 @@ bool UGS_LerpToHand::GetWorldTransform_Implementation
 	}
 
 	// Turn it off if we need to
-	if (Alpha == 1.0f)
+	if (OrigAlpha == 1.0f)
 	{
 		OnLerpToHandFinished.Broadcast();
 		CurrentLerpTime = 0.0f;

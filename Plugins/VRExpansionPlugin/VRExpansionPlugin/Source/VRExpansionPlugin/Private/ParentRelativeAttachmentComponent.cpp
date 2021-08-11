@@ -1,6 +1,7 @@
 // Copyright 1998-2016 Epic Games, Inc. All Rights Reserved.
 
 #include "ParentRelativeAttachmentComponent.h"
+#include "VRBaseCharacter.h"
 #include "VRCharacter.h"
 //#include "Runtime/Engine/Private/EnginePrivate.h"
 //#include "VRSimpleCharacter.h"
@@ -15,6 +16,8 @@ UParentRelativeAttachmentComponent::UParentRelativeAttachmentComponent(const FOb
 	// Let it sit in DuringPhysics like is the default
 	//PrimaryComponentTick.TickGroup = TG_PrePhysics;
 
+	bWantsInitializeComponent = true;
+
 	SetRelativeScale3D(FVector(1.0f, 1.0f, 1.0f));
 	SetRelativeLocation(FVector::ZeroVector);
 	YawTolerance = 0.0f;
@@ -26,10 +29,54 @@ UParentRelativeAttachmentComponent::UParentRelativeAttachmentComponent(const FOb
 	LerpTarget = 0.0f;
 	bWasSetOnce = false;
 
+	LeftControllerTrans = FTransform::Identity;
+	RightControllerTrans = FTransform::Identity;
+
 	bIgnoreRotationFromParent = false;
+	bUpdateInCharacterMovement = true;
+
+	bUseFeetLocation = false;
+	CustomOffset = FVector::ZeroVector;
+
+	//YawRotationMethod = EVR_PRC_RotationMethod::PRC_ROT_HMD;
 }
 
-void UParentRelativeAttachmentComponent::TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction *ThisTickFunction)
+void UParentRelativeAttachmentComponent::InitializeComponent()
+{
+	Super::InitializeComponent();
+
+	// Update our tracking
+	if (!bUseFeetLocation && AttachChar.IsValid()) // New case to early out and with less calculations
+	{
+		SetRelativeTransform(AttachChar->VRReplicatedCamera->GetRelativeTransform());
+	}
+
+}
+
+void UParentRelativeAttachmentComponent::OnAttachmentChanged()
+{
+	if (AVRCharacter* CharacterOwner = Cast<AVRCharacter>(this->GetOwner()))
+	{
+		AttachChar = CharacterOwner;
+	}
+	else
+	{
+		AttachChar.Reset();
+	}
+
+	if (AVRBaseCharacter * BaseCharacterOwner = Cast<AVRBaseCharacter>(this->GetOwner()))
+	{
+		AttachBaseChar = BaseCharacterOwner;
+	}
+	else
+	{
+		AttachBaseChar.Reset();
+	}
+
+	Super::OnAttachmentChanged();
+}
+
+void UParentRelativeAttachmentComponent::UpdateTracking(float DeltaTime)
 {
 	if (OptionalWaistTrackingParent.IsValid())
 	{
@@ -48,12 +95,13 @@ void UParentRelativeAttachmentComponent::TickComponent(float DeltaTime, enum ELe
 			}
 		}
 
+		TrackedParentWaist.AddToTranslation(CustomOffset);
 		SetRelativeTransform(TrackedParentWaist);
 
 	}
-	else if (AVRCharacter * CharacterOwner = Cast<AVRCharacter>(this->GetOwner())) // New case to early out and with less calculations
-	{		
-		SetRelativeRotAndLoc(CharacterOwner->VRRootReference->curCameraLoc, CharacterOwner->VRRootReference->StoredCameraRotOffset, DeltaTime);
+	else if (AttachChar.IsValid()) // New case to early out and with less calculations
+	{
+		SetRelativeRotAndLoc(AttachChar->VRRootReference->curCameraLoc, AttachChar->VRRootReference->StoredCameraRotOffset, DeltaTime);
 	}
 	else if (IsLocallyControlled() && GEngine->XRSystem.IsValid() && GEngine->XRSystem->IsHeadTrackingAllowed())
 	{
@@ -66,7 +114,7 @@ void UParentRelativeAttachmentComponent::TickComponent(float DeltaTime, enum ELe
 				curCameraLoc.X = 0;
 				curCameraLoc.Y = 0;
 			}
-			
+
 			if (!bIgnoreRotationFromParent)
 			{
 				FRotator InverseRot = UVRExpansionFunctionLibrary::GetHMDPureYaw_I(curRot.Rotator());
@@ -76,9 +124,22 @@ void UParentRelativeAttachmentComponent::TickComponent(float DeltaTime, enum ELe
 				SetRelativeRotAndLoc(curCameraLoc, FRotator::ZeroRotator, DeltaTime);
 		}
 	}
-	else if (AActor * owner = this->GetOwner())
+	else if (AttachBaseChar.IsValid())
 	{
-		if (UCameraComponent * CameraOwner = owner->FindComponentByClass<UCameraComponent>())
+		if (AttachBaseChar->VRReplicatedCamera)
+		{
+			if (!bIgnoreRotationFromParent)
+			{
+				FRotator InverseRot = UVRExpansionFunctionLibrary::GetHMDPureYaw(AttachBaseChar->VRReplicatedCamera->GetRelativeRotation());
+				SetRelativeRotAndLoc(AttachBaseChar->VRReplicatedCamera->GetRelativeLocation(), InverseRot, DeltaTime);
+			}
+			else
+				SetRelativeRotAndLoc(AttachBaseChar->VRReplicatedCamera->GetRelativeLocation(), FRotator::ZeroRotator, DeltaTime);
+		}
+	}
+	else if (AActor* owner = this->GetOwner())
+	{
+		if (UCameraComponent* CameraOwner = owner->FindComponentByClass<UCameraComponent>())
 		{
 			if (!bIgnoreRotationFromParent)
 			{
@@ -87,6 +148,23 @@ void UParentRelativeAttachmentComponent::TickComponent(float DeltaTime, enum ELe
 			}
 			else
 				SetRelativeRotAndLoc(CameraOwner->GetRelativeLocation(), FRotator::ZeroRotator, DeltaTime);
+		}
+	}
+}
+
+void UParentRelativeAttachmentComponent::TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction *ThisTickFunction)
+{
+	if (!bUpdateInCharacterMovement || !AttachChar.IsValid())
+	{
+		UpdateTracking(DeltaTime);
+	}
+	else
+	{
+		UCharacterMovementComponent * CharMove = AttachChar->GetCharacterMovement();
+		if (!CharMove || !CharMove->IsComponentTickEnabled() || !CharMove->IsActive())
+		{	
+			// Our character movement isn't handling our updates, lets do it ourself.
+			UpdateTracking(DeltaTime);
 		}
 	}
 

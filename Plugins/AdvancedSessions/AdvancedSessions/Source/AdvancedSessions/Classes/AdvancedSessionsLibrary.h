@@ -14,6 +14,9 @@
 #include "Engine/GameInstance.h"
 #include "Interfaces/OnlineSessionInterface.h"
 
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/GameSession.h"
+
 //#include "UObjectIterator.h"
 
 #include "AdvancedSessionsLibrary.generated.h"
@@ -28,6 +31,17 @@ class UAdvancedSessionsLibrary : public UBlueprintFunctionLibrary
 {
 	GENERATED_BODY()
 public:
+		//********* Session Admin Functions *************//	
+
+		// Kick a player from the currently active game session, only available on the server
+		UFUNCTION(BlueprintCallable, Category = "Online|AdvancedSessions", meta = (WorldContext = "WorldContextObject"))
+		static bool KickPlayer(UObject* WorldContextObject, APlayerController* PlayerToKick, FText KickReason);
+
+		// Ban a player from the currently active game session, only available on the server
+		// Note that the default gamesession class does not implement an actual ban list and just kicks when this is called
+		UFUNCTION(BlueprintCallable, Category = "Online|AdvancedSessions", meta = (WorldContext = "WorldContextObject"))
+		static bool BanPlayer(UObject* WorldContextObject, APlayerController* PlayerToBan, FText BanReason);
+
 		//********* Session Search Functions *************//	
 
 		// Adds or modifies session settings in an existing array depending on if they exist already or not
@@ -101,6 +115,7 @@ public:
 		static void GetSessionPropertyByte(const TArray<FSessionPropertyKeyPair> & ExtraSettings, FName SettingName, ESessionSettingSearchResult &SearchResult, uint8 &SettingValue);
 
 		// Get session custom information key/value as Bool
+		// Steam only currently supports Int,Float,String,BYTE values for search filtering!!!
 		UFUNCTION(BlueprintCallable, Category = "Online|AdvancedSessions|SessionInfo", meta = (ExpandEnumAsExecs = "SearchResult"))
 		static void GetSessionPropertyBool(const TArray<FSessionPropertyKeyPair> & ExtraSettings, FName SettingName, ESessionSettingSearchResult &SearchResult, bool &SettingValue);
 
@@ -122,6 +137,7 @@ public:
 		static FSessionPropertyKeyPair MakeLiteralSessionPropertyByte(FName Key, uint8 Value);
 
 		// Make a literal session custom information key/value pair from Bool
+		// Steam only currently supports Int,Float,String,BYTE values for search filtering!
 		UFUNCTION(BlueprintPure, Category = "Online|AdvancedSessions|SessionInfo|Literals")
 		static FSessionPropertyKeyPair MakeLiteralSessionPropertyBool(FName Key, bool Value);
 

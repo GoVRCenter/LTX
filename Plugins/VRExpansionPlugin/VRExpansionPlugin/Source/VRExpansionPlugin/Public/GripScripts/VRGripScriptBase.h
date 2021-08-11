@@ -52,14 +52,14 @@ public:
 	bool IsScriptActive();
 
 	// Is currently active helper variable, returned from IsScriptActive()
-	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "DefaultSettings")
+	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "GSSettings")
 	bool bIsActive;
 
 	// Returns if the script is going to modify the world transform of the grip
 	EGSTransformOverrideType GetWorldTransformOverrideType();
 
 	// Whether this script overrides or modifies the world transform
-	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "DefaultSettings")
+	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "GSSettings")
 	EGSTransformOverrideType WorldTransformOverrideType;
 
 	// Returns if the script wants auto drop to be ignored
@@ -69,7 +69,7 @@ public:
 	}
 
 	// Returns if we want to deny auto dropping
-	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "DefaultSettings")
+	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "GSSettings")
 		bool bDenyAutoDrop;
 
 	// Returns if the script wants to force a drop
@@ -79,7 +79,7 @@ public:
 	}
 
 	// Returns if we want to force a drop
-	UPROPERTY(BlueprintReadWrite, Category = "DefaultSettings")
+	UPROPERTY(BlueprintReadWrite, Category = "GSSettings")
 		bool bForceDrop;
 
 	// Flags the grip to be dropped as soon as possible
@@ -95,8 +95,8 @@ public:
 		return bDenyLateUpdates;
 	}
 
-	// Returns if we want to deny late updates
-	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "DefaultSettings")
+	// Returns if we want to inject changes prior to the physics handle
+	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "GSSettings")
 		bool bDenyLateUpdates;
 
 	// Returns if the script wants auto drop to be ignored
@@ -105,28 +105,28 @@ public:
 		return bInjectPrePhysicsHandle;
 	}
 
-	// Returns if we want to deny auto dropping
-	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "DefaultSettings")
+	// Returns if we want to inject changes prior to the physics handle
+	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "GSSettings")
 		bool bInjectPrePhysicsHandle;
 
-	virtual void HandlePrePhysicsHandle(UGripMotionControllerComponent* GrippingController, FBPActorPhysicsHandleInformation * HandleInfo, FTransform & KinPose);
+	virtual void HandlePrePhysicsHandle(UGripMotionControllerComponent* GrippingController, const FBPActorGripInformation &GripInfo, FBPActorPhysicsHandleInformation * HandleInfo, FTransform & KinPose);
 
-	// Returns if the script wants auto drop to be ignored
+	// Returns if we want to inject changes after the physics handle
 	FORCEINLINE bool InjectPostPhysicsHandle()
 	{
 		return bInjectPostPhysicsHandle;
 	}
 
-	// Returns if we want to deny auto dropping
-	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "DefaultSettings")
+	// Returns if we want to inject changes after the physics handle
+	UPROPERTY(BlueprintReadWrite, EditDefaultsOnly, Category = "GSSettings")
 		bool bInjectPostPhysicsHandle;
 
 	virtual void HandlePostPhysicsHandle(UGripMotionControllerComponent* GrippingController, FBPActorPhysicsHandleInformation * HandleInfo);
 
 	// Returns if the script is currently active and should be used
-	/*UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripScript")
-	bool Wants_DenyTeleport();
-	virtual bool Wants_DenyTeleport_Implementation();*/
+	UFUNCTION(BlueprintNativeEvent, BlueprintCallable, Category = "VRGripScript")
+	bool Wants_DenyTeleport(UGripMotionControllerComponent * Controller);
+	virtual bool Wants_DenyTeleport_Implementation(UGripMotionControllerComponent* Controller);
 
 	virtual void GetLifetimeReplicatedProps(TArray< class FLifetimeProperty > & OutLifetimeProps) const override;
 	
@@ -163,6 +163,7 @@ public:
 	virtual bool IsTickableWhenPaused() const override;
 	virtual ETickableTickType GetTickableTickType() const;
 	virtual TStatId GetStatId() const override;
+	virtual UWorld* GetWorld() const override;
 
 	// End tickable object information
 
@@ -173,7 +174,15 @@ public:
 
 	// Returns the current world transform of the owning object (or root comp of if it is an actor)
 	UFUNCTION(BlueprintPure, Category = "VRGripScript")
-		FTransform GetParentTransform(bool bGetWorldTransform = true);
+		FTransform GetParentTransform(bool bGetWorldTransform = true, FName BoneName = NAME_None);
+
+	// Returns the scene component of the parent, either being the parent itself or the root comp of it.
+	// Nullptr if there is no valid scene component
+	UFUNCTION(BlueprintCallable, Category = "VRGripScript")
+		USceneComponent* GetParentSceneComp();
+
+	// Returns the root body instance of the parent
+	FBodyInstance * GetParentBodyInstance(FName OptionalBoneName = NAME_None);
 
 	// Returns the parent component or actor to this
 	UFUNCTION(BlueprintPure, Category = "VRGripScript")
@@ -201,6 +210,8 @@ public:
 	virtual void OnEndPlay_Implementation(const EEndPlayReason::Type EndPlayReason);
 
 	void BeginPlay(UObject * CallingOwner);
+	bool bAlreadyNotifiedPlay = false;
+	virtual void PostInitProperties() override;
 
 	// Not all scripts will require this function, specific ones that use things like Lever logic however will. Best to call it.
 	// Grippables will automatically call this, however if you manually spawn a grip script during play or you make your own

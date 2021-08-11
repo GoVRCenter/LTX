@@ -22,6 +22,7 @@ UGS_GunTools::UGS_GunTools(const FObjectInitializer& ObjectInitializer) :
 
 
 	bHasRecoil = false;
+	bApplyRecoilAsPhysicalForce = false;
 	MaxRecoilTranslation = FVector::ZeroVector;
 	MaxRecoilRotation = FVector::ZeroVector;
 	MaxRecoilScale = FVector(1.f);
@@ -34,7 +35,73 @@ UGS_GunTools::UGS_GunTools(const FObjectInitializer& ObjectInitializer) :
 	bUseGlobalVirtualStockSettings = true;
 
 	bUseHighQualityRemoteSimulation = false;
+
+	bInjectPrePhysicsHandle = true;
+	//bInjectPostPhysicsHandle = true;
+	WeaponRootOrientationComponent = NAME_None;
+	OrientationComponentRelativeFacing = FTransform::Identity;
+	StoredRootOffset = FQuat::Identity;
 }
+
+void UGS_GunTools::OnBeginPlay_Implementation(UObject* CallingOwner)
+{
+	// Grip base has no super of this
+
+	if (WeaponRootOrientationComponent.IsValid())
+	{
+		if (AActor * Owner = GetOwner())
+		{
+			FName CurrentCompName = NAME_None;
+			for (UActorComponent* ChildComp : Owner->GetComponents())
+			{
+				CurrentCompName = ChildComp->GetFName();
+				if (CurrentCompName == NAME_None)
+					continue;
+
+				if (CurrentCompName == WeaponRootOrientationComponent)
+				{
+					if (USceneComponent * SceneComp = Cast<USceneComponent>(ChildComp))
+					{
+						OrientationComponentRelativeFacing = SceneComp->GetRelativeTransform();
+					}
+
+					break;
+				}
+			}
+		}
+	}
+}
+
+void UGS_GunTools::HandlePrePhysicsHandle(UGripMotionControllerComponent* GrippingController, const FBPActorGripInformation &GripInfo, FBPActorPhysicsHandleInformation* HandleInfo, FTransform& KinPose)
+{
+	if (!bIsActive)
+		return;
+
+	if (WeaponRootOrientationComponent != NAME_None)
+	{
+		StoredRootOffset = HandleInfo->RootBoneRotation.GetRotation().Inverse() * OrientationComponentRelativeFacing.GetRotation();
+
+		// Alter to rotate to x+ if we have an orientation component
+		FQuat DeltaQuat = OrientationComponentRelativeFacing.GetRotation();
+		
+		KinPose.SetRotation(KinPose.GetRotation() * StoredRootOffset);
+		HandleInfo->COMPosition.SetRotation(HandleInfo->COMPosition.GetRotation() * StoredRootOffset);
+	}
+	else
+	{
+		StoredRootOffset = FQuat::Identity;
+	}
+
+	if (GripInfo.bIsSlotGrip && !PivotOffset.IsZero())
+	{
+		KinPose.SetLocation(KinPose.TransformPosition(PivotOffset));
+		HandleInfo->COMPosition.SetLocation(HandleInfo->COMPosition.TransformPosition(PivotOffset));
+	}
+}
+
+/*void UGS_GunTools::HandlePostPhysicsHandle(UGripMotionControllerComponent* GrippingController, FBPActorPhysicsHandleInformation* HandleInfo)
+{
+}*/
 
 bool UGS_GunTools::GetWorldTransform_Implementation
 (
@@ -154,13 +221,6 @@ bool UGS_GunTools::GetWorldTransform_Implementation
 					OnVirtualStockModeChanged.Broadcast(bIsMounted);
 				}
 			}
-
-			if (bIsMounted && VirtualStockSettings.bSmoothStockHand)
-			{
-				FVector smoothedTrans = FMath::Lerp(WorldTransform.GetTranslation(), VirtualStockSettings.StockHandSmoothing.RunFilterSmoothing(WorldTransform.GetTranslation(), DeltaTime), VirtualStockSettings.SmoothingValueForStock);
-				WorldTransform.SetTranslation(smoothedTrans);
-
-			}
 		}
 	}
 	else
@@ -195,7 +255,6 @@ bool UGS_GunTools::GetWorldTransform_Implementation
 		}
 	}
 
-
 	// Handle the interp and multi grip situations, re-checking the grip situation here as it may have changed in the switch above.
 	if ((Grip.SecondaryGripInfo.bHasSecondaryAttachment && Grip.SecondaryGripInfo.SecondaryAttachment) || Grip.SecondaryGripInfo.GripLerpState == EGripLerpState::EndLerp)
 	{
@@ -215,8 +274,29 @@ bool UGS_GunTools::GetWorldTransform_Implementation
 		{
 			// Variables needed for multi grip transform
 			FVector BasePoint = ParentTransform.GetLocation();
-			FVector Pivot = (FTransform(PivotOffset) * ParentTransform).GetLocation();
-				
+			FVector Pivot = ParentTransform.GetLocation();
+
+			if (Grip.bIsSlotGrip)
+			{			
+				if (FBPActorPhysicsHandleInformation * PhysHandle = GrippingController->GetPhysicsGrip(Grip))
+				{
+					Pivot = SecondaryTransform.TransformPositionNoScale(SecondaryTransform.InverseTransformPositionNoScale(Pivot) + (StoredRootOffset * PhysHandle->RootBoneRotation.GetRotation()).RotateVector(PivotOffset));
+				}
+				else
+				{
+					Pivot = SecondaryTransform.TransformPositionNoScale(SecondaryTransform.InverseTransformPositionNoScale(Pivot) + OrientationComponentRelativeFacing.GetRotation().RotateVector(PivotOffset));
+				}
+			}
+
+			// Debug draw for COM movement with physics grips
+#if !(UE_BUILD_SHIPPING || UE_BUILD_TEST)
+			static const auto CVarDrawCOMDebugSpheresAccess = IConsoleManager::Get().FindConsoleVariable(TEXT("vr.DrawDebugCenterOfMassForGrips"));
+			if (CVarDrawCOMDebugSpheresAccess->GetInt() > 0)
+			{
+				DrawDebugSphere(GetWorld(), Pivot, 5, 32, FColor::Orange, false);
+			}
+#endif
+
 			const FTransform PivotToWorld = FTransform(FQuat::Identity, Pivot);//BasePoint);
 			const FTransform WorldToPivot = FTransform(FQuat::Identity, -Pivot);//-BasePoint);
 
@@ -233,28 +313,8 @@ bool UGS_GunTools::GetWorldTransform_Implementation
 			{
 				//FVector curLocation; // Current location of the secondary grip
 
-				bool bPulledControllerLoc = false;
-				if (GrippingController->bHasAuthority && Grip.SecondaryGripInfo.SecondaryAttachment->GetOwner() == GrippingController->GetOwner())
-				{
-					if (UGripMotionControllerComponent * OtherController = Cast<UGripMotionControllerComponent>(Grip.SecondaryGripInfo.SecondaryAttachment))
-					{
-						if (!OtherController->bUseWithoutTracking)
-						{
-							FVector Position = FVector::ZeroVector;
-							FRotator Orientation = FRotator::ZeroRotator;
-							float WorldToMeters = GetWorld() ? GetWorld()->GetWorldSettings()->WorldToMeters : 100.0f;
-							if (OtherController->GripPollControllerState(Position, Orientation, WorldToMeters))
-							{
-								frontLoc = OtherController->CalcControllerComponentToWorld(Orientation, Position).GetLocation() - BasePoint;
-								///*curLocation*/ frontLoc = OtherController->CalcNewComponentToWorld(FTransform(Orientation, Position)).GetLocation() - BasePoint;
-								bPulledControllerLoc = true;
-							}
-						}
-					}
-				}
-
-				if (!bPulledControllerLoc)
-					/*curLocation*/ frontLoc = Grip.SecondaryGripInfo.SecondaryAttachment->GetComponentLocation() - BasePoint;
+				// Calculates the correct secondary attachment location and sets frontLoc to it
+				CalculateSecondaryLocation(frontLoc, BasePoint, Grip, GrippingController);
 
 				frontLocOrig = (/*WorldTransform*/SecondaryTransform.TransformPosition(Grip.SecondaryGripInfo.SecondaryRelativeTransform.GetLocation())) - BasePoint;
 
@@ -355,6 +415,17 @@ bool UGS_GunTools::GetWorldTransform_Implementation
 		else
 		{
 			WorldTransform = NewWorldTransform;
+		}
+
+		if (bIsMounted && VirtualStockSettings.bSmoothStockHand)
+		{
+			if (GrippingController->GetAttachParent())
+			{
+				FTransform ParentTrans = GrippingController->GetAttachParent()->GetComponentTransform();
+				FTransform ParentRel = WorldTransform * ParentTrans.Inverse();
+				ParentRel.Blend(ParentRel, VirtualStockSettings.StockHandSmoothing.RunFilterSmoothing(ParentRel, DeltaTime), VirtualStockSettings.SmoothingValueForStock);
+				WorldTransform = ParentRel * ParentTrans;
+			}
 		}
 
 		if (Grip.SecondaryGripInfo.bHasSecondaryAttachment)
@@ -458,35 +529,45 @@ void UGS_GunTools::ResetRecoil()
 	BackEndRecoilTarget = FTransform::Identity;
 }
 
-void UGS_GunTools::AddRecoilInstance(const FTransform & RecoilAddition)
+void UGS_GunTools::AddRecoilInstance(const FTransform & RecoilAddition, FVector Optional_Location)
 {
 	if (!bHasRecoil)
 		return;
 
-	BackEndRecoilTarget += RecoilAddition;
+	if (bApplyRecoilAsPhysicalForce)
+	{		
+		if (FBodyInstance * BodyInst = GetParentBodyInstance())
+		{
+			BodyInst->AddImpulseAtPosition(RecoilAddition.GetLocation(), Optional_Location);
+		}
+	}
+	else
+	{
+		BackEndRecoilTarget += RecoilAddition;
 
-	FVector CurVec = BackEndRecoilTarget.GetTranslation();
+		FVector CurVec = BackEndRecoilTarget.GetTranslation();
 
-	// Identity on min value is technically wrong, what if they want to recoil in the opposing direction?
-	CurVec.X = FMath::Clamp(CurVec.X, FMath::Min(0.f, MaxRecoilTranslation.X), FMath::Max(MaxRecoilTranslation.X, 0.f));
-	CurVec.Y = FMath::Clamp(CurVec.Y, FMath::Min(0.f, MaxRecoilTranslation.Y), FMath::Max(MaxRecoilTranslation.Y, 0.f));
-	CurVec.Z = FMath::Clamp(CurVec.Z, FMath::Min(0.f, MaxRecoilTranslation.Z), FMath::Max(MaxRecoilTranslation.Z, 0.f));
-	BackEndRecoilTarget.SetTranslation(CurVec);
+		// Identity on min value is technically wrong, what if they want to recoil in the opposing direction?
+		CurVec.X = FMath::Clamp(CurVec.X, FMath::Min(0.f, MaxRecoilTranslation.X), FMath::Max(MaxRecoilTranslation.X, 0.f));
+		CurVec.Y = FMath::Clamp(CurVec.Y, FMath::Min(0.f, MaxRecoilTranslation.Y), FMath::Max(MaxRecoilTranslation.Y, 0.f));
+		CurVec.Z = FMath::Clamp(CurVec.Z, FMath::Min(0.f, MaxRecoilTranslation.Z), FMath::Max(MaxRecoilTranslation.Z, 0.f));
+		BackEndRecoilTarget.SetTranslation(CurVec);
 
-	FVector CurScale = BackEndRecoilTarget.GetScale3D();
+		FVector CurScale = BackEndRecoilTarget.GetScale3D();
 
-	// Identity on min value is technically wrong, what if they want to recoil in the opposing direction?
-	CurScale.X = FMath::Clamp(CurScale.X, FMath::Min(0.f, MaxRecoilScale.X), FMath::Max(MaxRecoilScale.X, 0.f));
-	CurScale.Y = FMath::Clamp(CurScale.Y, FMath::Min(0.f, MaxRecoilScale.Y), FMath::Max(MaxRecoilScale.Y, 0.f));
-	CurScale.Z = FMath::Clamp(CurScale.Z, FMath::Min(0.f, MaxRecoilScale.Z), FMath::Max(MaxRecoilScale.Z, 0.f));
-	BackEndRecoilTarget.SetScale3D(CurScale);
+		// Identity on min value is technically wrong, what if they want to recoil in the opposing direction?
+		CurScale.X = FMath::Clamp(CurScale.X, FMath::Min(0.f, MaxRecoilScale.X), FMath::Max(MaxRecoilScale.X, 0.f));
+		CurScale.Y = FMath::Clamp(CurScale.Y, FMath::Min(0.f, MaxRecoilScale.Y), FMath::Max(MaxRecoilScale.Y, 0.f));
+		CurScale.Z = FMath::Clamp(CurScale.Z, FMath::Min(0.f, MaxRecoilScale.Z), FMath::Max(MaxRecoilScale.Z, 0.f));
+		BackEndRecoilTarget.SetScale3D(CurScale);
 
-	FRotator curRot = BackEndRecoilTarget.Rotator();
-	curRot.Pitch = FMath::Clamp(curRot.Pitch, FMath::Min(0.f, MaxRecoilRotation.Y), FMath::Max(MaxRecoilRotation.Y, 0.f));
-	curRot.Yaw = FMath::Clamp(curRot.Yaw, FMath::Min(0.f, MaxRecoilRotation.Z), FMath::Max(MaxRecoilRotation.Z, 0.f));
-	curRot.Roll = FMath::Clamp(curRot.Roll, FMath::Min(0.f, MaxRecoilRotation.X), FMath::Max(MaxRecoilRotation.X, 0.f));
+		FRotator curRot = BackEndRecoilTarget.Rotator();
+		curRot.Pitch = FMath::Clamp(curRot.Pitch, FMath::Min(0.f, MaxRecoilRotation.Y), FMath::Max(MaxRecoilRotation.Y, 0.f));
+		curRot.Yaw = FMath::Clamp(curRot.Yaw, FMath::Min(0.f, MaxRecoilRotation.Z), FMath::Max(MaxRecoilRotation.Z, 0.f));
+		curRot.Roll = FMath::Clamp(curRot.Roll, FMath::Min(0.f, MaxRecoilRotation.X), FMath::Max(MaxRecoilRotation.X, 0.f));
 
-	BackEndRecoilTarget.SetRotation(curRot.Quaternion());
+		BackEndRecoilTarget.SetRotation(curRot.Quaternion());
 
-	bHasActiveRecoil = !BackEndRecoilTarget.Equals(FTransform::Identity);
+		bHasActiveRecoil = !BackEndRecoilTarget.Equals(FTransform::Identity);
+	}
 }

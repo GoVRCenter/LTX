@@ -4,6 +4,15 @@
 #include "Engine/Engine.h"
 #include "IXRTrackingSystem.h"
 #include "IHeadMountedDisplay.h"
+#include "Grippables/HandSocketComponent.h"
+
+#if WITH_CHAOS
+#include "Chaos/ParticleHandle.h"
+#include "Chaos/KinematicGeometryParticles.h"
+#include "Chaos/ParticleHandle.h"
+#include "PhysicsProxy/SingleParticlePhysicsProxy.h"
+#include "PBDRigidsSolver.h"
+#endif
 
 #if WITH_EDITOR
 #include "Editor/UnrealEd/Classes/Editor/EditorEngine.h"
@@ -11,6 +20,126 @@
 
 //General Log
 DEFINE_LOG_CATEGORY(VRExpansionFunctionLibraryLog);
+
+void UVRExpansionFunctionLibrary::SetObjectsIgnoreCollision(UPrimitiveComponent* Prim1, FName OptionalBoneName1, UPrimitiveComponent* Prim2, FName OptionalBoneName2, bool bIgnoreCollision)
+{
+	if (Prim1 && Prim2)
+	{
+		FBodyInstance *Inst1 = Prim1->GetBodyInstance(OptionalBoneName1);
+		FBodyInstance *Inst2 = Prim2->GetBodyInstance(OptionalBoneName2);
+
+		if (Inst1 && Inst2)
+		{
+			Inst1->SetContactModification(bIgnoreCollision);
+			Inst2->SetContactModification(bIgnoreCollision);
+			if (FPhysScene* PhysScene = Prim1->GetWorld()->GetPhysicsScene())
+			{
+#if WITH_CHAOS
+				/*FContactModBodyInstancePair newContactPair;
+				newContactPair.Actor1 = Inst1->ActorHandle;
+				newContactPair.Actor2 = Inst2->ActorHandle;
+				newContactPair.bBody1IgnoreEntireActor = false;
+				newContactPair.bBody2IgnoreEntireActor = false;
+				*/
+
+				Chaos::FUniqueIdx ID0 = Inst1->ActorHandle->UniqueIdx();
+				Chaos::FUniqueIdx ID1 = Inst2->ActorHandle->UniqueIdx();
+
+				Chaos::FIgnoreCollisionManager& IgnoreCollisionManager = PhysScene->GetSolver()->GetEvolution()->GetBroadPhase().GetIgnoreCollisionManager();
+
+				FPhysicsCommand::ExecuteWrite(PhysScene, [&]()
+					{
+						using namespace Chaos;
+
+						if (bIgnoreCollision)
+						{
+							if (!IgnoreCollisionManager.IgnoresCollision(ID0, ID1))
+							{
+								TPBDRigidParticleHandle<FReal, 3>* ParticleHandle0 = Inst1->ActorHandle->Handle()->CastToRigidParticle();
+								TPBDRigidParticleHandle<FReal, 3>* ParticleHandle1 = Inst2->ActorHandle->Handle()->CastToRigidParticle();
+
+								if (ParticleHandle0 && ParticleHandle1)
+								{
+									ParticleHandle0->AddCollisionConstraintFlag(Chaos::ECollisionConstraintFlags::CCF_BroadPhaseIgnoreCollisions);
+									IgnoreCollisionManager.AddIgnoreCollisionsFor(ID0, ID1);
+
+									ParticleHandle1->AddCollisionConstraintFlag(Chaos::ECollisionConstraintFlags::CCF_BroadPhaseIgnoreCollisions);
+									IgnoreCollisionManager.AddIgnoreCollisionsFor(ID1, ID0);
+								}
+							}
+						}
+						else
+						{
+							if (IgnoreCollisionManager.IgnoresCollision(ID0, ID1))
+							{
+								TPBDRigidParticleHandle<FReal, 3>* ParticleHandle0 = Inst1->ActorHandle->Handle()->CastToRigidParticle();
+								TPBDRigidParticleHandle<FReal, 3>* ParticleHandle1 = Inst2->ActorHandle->Handle()->CastToRigidParticle();
+
+								if (ParticleHandle0 && ParticleHandle1)
+								{
+									IgnoreCollisionManager.RemoveIgnoreCollisionsFor(ID0, ID1);
+									IgnoreCollisionManager.RemoveIgnoreCollisionsFor(ID1, ID0);
+
+									if (IgnoreCollisionManager.NumIgnoredCollision(ID0) < 1)
+									{
+										ParticleHandle0->RemoveCollisionConstraintFlag(Chaos::ECollisionConstraintFlags::CCF_BroadPhaseIgnoreCollisions);
+									}
+
+									if (IgnoreCollisionManager.NumIgnoredCollision(ID1) < 1)
+									{
+										ParticleHandle1->RemoveCollisionConstraintFlag(Chaos::ECollisionConstraintFlags::CCF_BroadPhaseIgnoreCollisions);
+									}
+								}
+							}
+						}
+					});
+
+#elif PHYSICS_INTERFACE_PHYSX
+				if (PxScene* PScene = PhysScene->GetPxScene())
+				{
+					if (FCCDContactModifyCallbackVR* ContactCallback = (FCCDContactModifyCallbackVR*)PScene->getCCDContactModifyCallback())
+					{
+						FRWScopeLock(ContactCallback->RWAccessLock, FRWScopeLockType::SLT_Write);
+						FContactModBodyInstancePair newContactPair;
+						newContactPair.Actor1 = Inst1->ActorHandle;
+						newContactPair.Actor2 = Inst2->ActorHandle;
+						newContactPair.bBody1IgnoreEntireActor = false;
+						newContactPair.bBody2IgnoreEntireActor = false;
+
+						if (bIgnoreCollision)
+							ContactCallback->ContactsToIgnore.AddUnique(newContactPair);
+						else
+							ContactCallback->ContactsToIgnore.Remove(newContactPair);
+					}
+
+					if (FContactModifyCallbackVR* ContactCallback = (FContactModifyCallbackVR*)PScene->getContactModifyCallback())
+					{
+						FRWScopeLock(ContactCallback->RWAccessLock, FRWScopeLockType::SLT_Write);
+						FContactModBodyInstancePair newContactPair;
+						newContactPair.Actor1 = Inst1->ActorHandle;
+						newContactPair.Actor2 = Inst2->ActorHandle;
+						newContactPair.bBody1IgnoreEntireActor = false;
+						newContactPair.bBody2IgnoreEntireActor = false;
+
+						if (bIgnoreCollision)
+							ContactCallback->ContactsToIgnore.AddUnique(newContactPair);
+						else
+							ContactCallback->ContactsToIgnore.Remove(newContactPair);
+					}
+				}
+#endif
+			}
+		}
+		else
+		{
+			UE_LOG(VRExpansionFunctionLibraryLog, Error, TEXT("Set Objects Ignore Collision called with object(s) with an invalid body instance!!"));
+		}
+	}
+	else
+	{
+		UE_LOG(VRExpansionFunctionLibraryLog, Error, TEXT("Set Objects Ignore Collision called with invalid object(s)!!"));
+	}
+}
 
 void UVRExpansionFunctionLibrary::LowPassFilter_RollingAverage(FVector lastAverage, FVector newSample, FVector & newAverage, int32 numSamples)
 {
@@ -37,10 +166,12 @@ bool UVRExpansionFunctionLibrary::GetIsActorMovable(AActor * ActorToCheck)
 	return false;
 }
 
-void UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName(FName SlotType, AActor * Actor, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform)
+void UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName(FName SlotType, AActor * Actor, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent* QueryController)
 {
 	bHadSlotInRange = false;
 	SlotWorldTransform = FTransform::Identity;
+	SlotName = NAME_None;
+	UHandSocketComponent* TargetHandSocket = nullptr;
 
 	if (!Actor)
 		return;
@@ -74,18 +205,64 @@ void UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName(FName SlotType, A
 			}
 		}
 
+		TArray<USceneComponent*> AttachChildren = rootComp->GetAttachChildren();
+
+		for (USceneComponent * AttachChild : AttachChildren)
+		{
+			if (AttachChild && AttachChild->IsA<UHandSocketComponent>())
+			{
+				if (UHandSocketComponent* SocketComp = Cast<UHandSocketComponent>(AttachChild))
+				{
+					if (SocketComp->SlotPrefix.ToString().Contains(GripIdentifier, ESearchCase::IgnoreCase, ESearchDir::FromStart))
+					{
+						float vecLen = FVector::DistSquared(RelativeWorldLocation, SocketComp->GetRelativeLocation());
+
+						if (SocketComp->bAlwaysInRange)
+						{
+							TargetHandSocket = SocketComp;
+							ClosestSlotDistance = vecLen;
+							bHadSlotInRange = true;
+						}
+						else
+						{
+							float RangeVal = (SocketComp->OverrideDistance > 0.0f ? FMath::Square(SocketComp->OverrideDistance) : MaxRange);
+							if (RangeVal >= vecLen && (ClosestSlotDistance < 0.0f || vecLen < ClosestSlotDistance))
+							{
+								TargetHandSocket = SocketComp;
+								ClosestSlotDistance = vecLen;
+								bHadSlotInRange = true;
+							}
+						}
+					}
+				}
+			}
+		}
+
+
 		if (bHadSlotInRange)
 		{
-			SlotWorldTransform = rootComp->GetSocketTransform(SocketNames[foundIndex]);
-			SlotWorldTransform.SetScale3D(FVector(1.0f));
+			if (TargetHandSocket)
+			{
+				SlotWorldTransform = TargetHandSocket->GetHandSocketTransform(QueryController);
+				SlotName = TargetHandSocket->GetFName();
+				SlotWorldTransform.SetScale3D(FVector(1.0f));
+			}
+			else
+			{
+				SlotWorldTransform = rootComp->GetSocketTransform(SocketNames[foundIndex]);
+				SlotName = SocketNames[foundIndex];
+				SlotWorldTransform.SetScale3D(FVector(1.0f));
+			}
 		}
 	}
 }
 
-void UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName_Component(FName SlotType, UPrimitiveComponent * Component, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform)
+void UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName_Component(FName SlotType, UPrimitiveComponent * Component, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent* QueryController)
 {
 	bHadSlotInRange = false;
 	SlotWorldTransform = FTransform::Identity;
+	SlotName = NAME_None;
+	UHandSocketComponent* TargetHandSocket = nullptr;
 
 	if (!Component)
 		return;
@@ -116,10 +293,52 @@ void UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName_Component(FName S
 		}
 	}
 
+	TArray<USceneComponent*> AttachChildren = Component->GetAttachChildren();
+
+	for (USceneComponent* AttachChild : AttachChildren)
+	{
+		if (AttachChild && AttachChild->IsA<UHandSocketComponent>())
+		{
+			if (UHandSocketComponent* SocketComp = Cast<UHandSocketComponent>(AttachChild))
+			{
+				if (SocketComp->SlotPrefix.ToString().Contains(GripIdentifier, ESearchCase::IgnoreCase, ESearchDir::FromStart))
+				{
+					float vecLen = FVector::DistSquared(RelativeWorldLocation, SocketComp->GetRelativeLocation());
+					if (SocketComp->bAlwaysInRange)
+					{
+						TargetHandSocket = SocketComp;
+						ClosestSlotDistance = vecLen;
+						bHadSlotInRange = true;
+					}
+					else
+					{
+						float RangeVal = (SocketComp->OverrideDistance > 0.0f ? FMath::Square(SocketComp->OverrideDistance) : MaxRange);
+						if (RangeVal >= vecLen && (ClosestSlotDistance < 0.0f || vecLen < ClosestSlotDistance))
+						{
+							TargetHandSocket = SocketComp;
+							ClosestSlotDistance = vecLen;
+							bHadSlotInRange = true;
+						}
+					}
+				}
+			}
+		}
+	}
+
 	if (bHadSlotInRange)
 	{
-		SlotWorldTransform = Component->GetSocketTransform(SocketNames[foundIndex]);
-		SlotWorldTransform.SetScale3D(FVector(1.0f));
+		if (TargetHandSocket)
+		{
+			SlotWorldTransform = TargetHandSocket->GetHandSocketTransform(QueryController);
+			SlotName = TargetHandSocket->GetFName();
+			SlotWorldTransform.SetScale3D(FVector(1.0f));
+		}
+		else
+		{
+			SlotWorldTransform = Component->GetSocketTransform(SocketNames[foundIndex]);
+			SlotName = SocketNames[foundIndex];
+			SlotWorldTransform.SetScale3D(FVector(1.0f));
+		}
 	}
 }
 
@@ -218,9 +437,18 @@ bool UVRExpansionFunctionLibrary::IsInVREditorPreviewOrGame()
 #if WITH_EDITOR
 	if (GIsEditor)
 	{
-		
-		UEditorEngine* EdEngine = Cast<UEditorEngine>(GEngine);
-		return EdEngine->bUseVRPreviewForPlayWorld;
+		if (UEditorEngine* EdEngine = Cast<UEditorEngine>(GEngine))
+		{
+			TOptional<FPlayInEditorSessionInfo> PlayInfo = EdEngine->GetPlayInEditorSessionInfo();
+			if (PlayInfo.IsSet())
+			{				
+				return PlayInfo->OriginalRequestParams.SessionPreviewTypeOverride == EPlaySessionPreviewType::VRPreview;
+			}
+			else
+			{
+				return false;
+			}
+		}
 	}
 #endif
 
@@ -233,9 +461,18 @@ bool UVRExpansionFunctionLibrary::IsInVREditorPreview()
 #if WITH_EDITOR
 	if (GIsEditor)
 	{
-
-		UEditorEngine* EdEngine = Cast<UEditorEngine>(GEngine);
-		return EdEngine->bUseVRPreviewForPlayWorld;
+		if (UEditorEngine* EdEngine = Cast<UEditorEngine>(GEngine))
+		{
+			TOptional<FPlayInEditorSessionInfo> PlayInfo = EdEngine->GetPlayInEditorSessionInfo();
+			if (PlayInfo.IsSet())
+			{
+				return PlayInfo->OriginalRequestParams.SessionPreviewTypeOverride == EPlaySessionPreviewType::VRPreview;
+			}
+			else
+			{
+				return false;
+			}
+		}
 	}
 #endif
 

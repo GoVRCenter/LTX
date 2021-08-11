@@ -1,6 +1,7 @@
 // Copyright 1998-2016 Epic Games, Inc. All Rights Reserved.
 
 #include "Interactibles/VRMountComponent.h"
+#include "VRExpansionFunctionLibrary.h"
 #include "Net/UnrealNetwork.h"
 
 //=============================================================================
@@ -31,6 +32,8 @@ UVRMountComponent::UVRMountComponent(const FObjectInitializer& ObjectInitializer
 
 	bDenyGripping = false;
 
+	PrimarySlotRange = 100.f;
+	SecondarySlotRange = 100.f;
 	GripPriority = 1;
 
 	FlipingZone = 0.4;
@@ -62,11 +65,9 @@ void UVRMountComponent::PreReplication(IRepChangedPropertyTracker & ChangedPrope
 	// Don't replicate if set to not do it
 	DOREPLIFETIME_ACTIVE_OVERRIDE(UVRMountComponent, GameplayTags, bRepGameplayTags);
 
-	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeLocation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeRotation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeScale3D, bReplicateMovement);
-	PRAGMA_ENABLE_DEPRECATION_WARNINGS
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeLocation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeRotation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeScale3D, bReplicateMovement);
 }
 
 void UVRMountComponent::OnRegister()
@@ -419,6 +420,11 @@ void UVRMountComponent::OnGripRelease_Implementation(UGripMotionControllerCompon
 		this->SetComponentTickEnabled(false);
 }
 
+void UVRMountComponent::SetGripPriority(int NewGripPriority)
+{
+	GripPriority = NewGripPriority;
+}
+
 void UVRMountComponent::OnChildGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation) {}
 void UVRMountComponent::OnChildGripRelease_Implementation(UGripMotionControllerComponent * ReleasingController, const FBPActorGripInformation & GripInformation, bool bWasSocketed) {}
 void UVRMountComponent::OnSecondaryGrip_Implementation(UGripMotionControllerComponent * GripOwningController, USceneComponent * SecondaryGripComponent, const FBPActorGripInformation & GripInformation) {}
@@ -430,7 +436,7 @@ void UVRMountComponent::OnEndSecondaryUsed_Implementation() {}
 void UVRMountComponent::OnInput_Implementation(FKey Key, EInputEvent KeyEvent) {}
 bool UVRMountComponent::RequestsSocketing_Implementation(USceneComponent *& ParentToSocketTo, FName & OptionalSocketName, FTransform_NetQuantize & RelativeTransform) { return false; }
 
-bool UVRMountComponent::DenyGripping_Implementation()
+bool UVRMountComponent::DenyGripping_Implementation(UGripMotionControllerComponent * GripInitiator)
 {
 	return bDenyGripping;
 }
@@ -502,9 +508,12 @@ void UVRMountComponent::ClosestPrimarySlotInRange_Implementation(FVector WorldLo
 bHadSlotInRange = false;
 }*/
 
-void UVRMountComponent::ClosestGripSlotInRange_Implementation(FVector WorldLocation, bool bSecondarySlot, bool & bHadSlotInRange, FTransform & SlotWorldTransform, UGripMotionControllerComponent * CallingController, FName OverridePrefix)
+void UVRMountComponent::ClosestGripSlotInRange_Implementation(FVector WorldLocation, bool bSecondarySlot, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent * CallingController, FName OverridePrefix)
 {
-	bHadSlotInRange = false;
+	if (OverridePrefix.IsNone())
+		bSecondarySlot ? OverridePrefix = "VRGripS" : OverridePrefix = "VRGripP";
+
+	UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName_Component(OverridePrefix, this, WorldLocation, bSecondarySlot ? SecondarySlotRange : PrimarySlotRange, bHadSlotInRange, SlotWorldTransform, SlotName, CallingController);
 }
 
 bool UVRMountComponent::AllowsMultipleGrips_Implementation()

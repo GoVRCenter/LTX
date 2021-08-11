@@ -3,6 +3,10 @@
 #include "Grippables/GrippableSkeletalMeshActor.h"
 #include "TimerManager.h"
 #include "Net/UnrealNetwork.h"
+#include "PhysicsReplication.h"
+#if WITH_PUSH_MODEL
+#include "Net/Core/PushModel/PushModel.h"
+#endif
 
 UOptionalRepSkeletalMeshComponent::UOptionalRepSkeletalMeshComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -10,26 +14,24 @@ UOptionalRepSkeletalMeshComponent::UOptionalRepSkeletalMeshComponent(const FObje
 	bReplicateMovement = true;
 }
 
-void UOptionalRepSkeletalMeshComponent::PreReplication(IRepChangedPropertyTracker & ChangedPropertyTracker)
+void UOptionalRepSkeletalMeshComponent::PreReplication(IRepChangedPropertyTracker& ChangedPropertyTracker)
 {
 	Super::PreReplication(ChangedPropertyTracker);
 
 	// Don't replicate if set to not do it
-	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeLocation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeRotation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeScale3D, bReplicateMovement);
-	PRAGMA_ENABLE_DEPRECATION_WARNINGS
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeLocation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeRotation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeScale3D, bReplicateMovement);
 }
 
-void UOptionalRepSkeletalMeshComponent::GetLifetimeReplicatedProps(TArray< class FLifetimeProperty > & OutLifetimeProps) const
+void UOptionalRepSkeletalMeshComponent::GetLifetimeReplicatedProps(TArray< class FLifetimeProperty >& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	DOREPLIFETIME(UOptionalRepSkeletalMeshComponent, bReplicateMovement);
 }
 
-  //=============================================================================
+//=============================================================================
 AGrippableSkeletalMeshActor::AGrippableSkeletalMeshActor(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer.SetDefaultSubobjectClass<UOptionalRepSkeletalMeshComponent>(TEXT("SkeletalMeshComponent0")))
 {
@@ -62,28 +64,168 @@ AGrippableSkeletalMeshActor::AGrippableSkeletalMeshActor(const FObjectInitialize
 	MinNetUpdateFrequency = 30.0f;
 }
 
-void AGrippableSkeletalMeshActor::GetLifetimeReplicatedProps(TArray< class FLifetimeProperty > & OutLifetimeProps) const
+void AGrippableSkeletalMeshActor::GetLifetimeReplicatedProps(TArray< class FLifetimeProperty >& OutLifetimeProps) const
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
-	
+
 	DOREPLIFETIME/*_CONDITION*/(AGrippableSkeletalMeshActor, GripLogicScripts);// , COND_Custom);
 	DOREPLIFETIME(AGrippableSkeletalMeshActor, bRepGripSettingsAndGameplayTags);
 	DOREPLIFETIME(AGrippableSkeletalMeshActor, bAllowIgnoringAttachOnOwner);
 	DOREPLIFETIME(AGrippableSkeletalMeshActor, ClientAuthReplicationData);
 	DOREPLIFETIME_CONDITION(AGrippableSkeletalMeshActor, VRGripInterfaceSettings, COND_Custom);
 	DOREPLIFETIME_CONDITION(AGrippableSkeletalMeshActor, GameplayTags, COND_Custom);
+
+	DISABLE_REPLICATED_PRIVATE_PROPERTY(AActor, AttachmentReplication);
+
+	FDoRepLifetimeParams AttachmentReplicationParams{ COND_Custom, REPNOTIFY_Always, /*bIsPushBased=*/true };
+	DOREPLIFETIME_WITH_PARAMS_FAST(AGrippableSkeletalMeshActor, AttachmentWeldReplication, AttachmentReplicationParams);
 }
 
-void AGrippableSkeletalMeshActor::PreReplication(IRepChangedPropertyTracker & ChangedPropertyTracker)
+void AGrippableSkeletalMeshActor::PreReplication(IRepChangedPropertyTracker& ChangedPropertyTracker)
 {
-	Super::PreReplication(ChangedPropertyTracker);
-
 	// Don't replicate if set to not do it
 	DOREPLIFETIME_ACTIVE_OVERRIDE(AGrippableSkeletalMeshActor, VRGripInterfaceSettings, bRepGripSettingsAndGameplayTags);
 	DOREPLIFETIME_ACTIVE_OVERRIDE(AGrippableSkeletalMeshActor, GameplayTags, bRepGripSettingsAndGameplayTags);
+
+	//Super::PreReplication(ChangedPropertyTracker);
+
+#if WITH_PUSH_MODEL
+	const AActor* const OldAttachParent = AttachmentWeldReplication.AttachParent;
+	const UActorComponent* const OldAttachComponent = AttachmentWeldReplication.AttachComponent;
+#endif
+
+	// Attachment replication gets filled in by GatherCurrentMovement(), but in the case of a detached root we need to trigger remote detachment.
+	AttachmentWeldReplication.AttachParent = nullptr;
+	AttachmentWeldReplication.AttachComponent = nullptr;
+
+	GatherCurrentMovement();
+
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(AActor, ReplicatedMovement, IsReplicatingMovement());
+
+	// Don't need to replicate AttachmentReplication if the root component replicates, because it already handles it.
+	DOREPLIFETIME_ACTIVE_OVERRIDE(AGrippableSkeletalMeshActor, AttachmentWeldReplication, RootComponent && !RootComponent->GetIsReplicated());
+
+	// Don't need to replicate AttachmentReplication if the root component replicates, because it already handles it.
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(AActor, AttachmentReplication, RootComponent && !RootComponent->GetIsReplicated());
+
+
+#if WITH_PUSH_MODEL
+	if (UNLIKELY(OldAttachParent != AttachmentWeldReplication.AttachParent || OldAttachComponent != AttachmentWeldReplication.AttachComponent))
+	{
+		//MARK_PROPERTY_DIRTY_FROM_NAME(AGrippableSkeletalMeshActor, AttachmentWeldReplication, this);
+	}
+#endif
+
+	UBlueprintGeneratedClass* BPClass = Cast<UBlueprintGeneratedClass>(GetClass());
+	if (BPClass != nullptr)
+	{
+		BPClass->InstancePreReplication(this, ChangedPropertyTracker);
+	}
 }
 
-bool AGrippableSkeletalMeshActor::ReplicateSubobjects(UActorChannel* Channel, class FOutBunch *Bunch, FReplicationFlags *RepFlags)
+void AGrippableSkeletalMeshActor::GatherCurrentMovement()
+{
+	if (IsReplicatingMovement() || (RootComponent && RootComponent->GetAttachParent()))
+	{
+		bool bWasAttachmentModified = false;
+		bool bWasRepMovementModified = false;
+
+		AActor* OldAttachParent = AttachmentWeldReplication.AttachParent;
+		USceneComponent* OldAttachComponent = AttachmentWeldReplication.AttachComponent;
+
+		AttachmentWeldReplication.AttachParent = nullptr;
+		AttachmentWeldReplication.AttachComponent = nullptr;
+
+		FRepMovement& RepMovement = GetReplicatedMovement_Mutable();
+
+		UPrimitiveComponent* RootPrimComp = Cast<UPrimitiveComponent>(GetRootComponent());
+		if (RootPrimComp && RootPrimComp->IsSimulatingPhysics())
+		{
+			FRigidBodyState RBState;
+			RootPrimComp->GetRigidBodyState(RBState);
+
+			RepMovement.FillFrom(RBState, this);
+			// Don't replicate movement if we're welded to another parent actor.
+			// Their replication will affect our position indirectly since we are attached.
+			RepMovement.bRepPhysics = !RootPrimComp->IsWelded();
+
+			if (!RepMovement.bRepPhysics)
+			{
+				if (RootComponent->GetAttachParent() != nullptr)
+				{
+					// Networking for attachments assumes the RootComponent of the AttachParent actor. 
+					// If that's not the case, we can't update this, as the client wouldn't be able to resolve the Component and would detach as a result.
+					AttachmentWeldReplication.AttachParent = RootComponent->GetAttachParent()->GetAttachmentRootActor();
+					if (AttachmentWeldReplication.AttachParent != nullptr)
+					{
+						AttachmentWeldReplication.LocationOffset = RootComponent->GetRelativeLocation();
+						AttachmentWeldReplication.RotationOffset = RootComponent->GetRelativeRotation();
+						AttachmentWeldReplication.RelativeScale3D = RootComponent->GetRelativeScale3D();
+						AttachmentWeldReplication.AttachComponent = RootComponent->GetAttachParent();
+						AttachmentWeldReplication.AttachSocket = RootComponent->GetAttachSocketName();
+						AttachmentWeldReplication.bIsWelded = RootPrimComp ? RootPrimComp->IsWelded() : false;
+
+						// Technically, the values might have stayed the same, but we'll just assume they've changed.
+						bWasAttachmentModified = true;
+					}
+				}
+			}
+
+			// Technically, the values might have stayed the same, but we'll just assume they've changed.
+			bWasRepMovementModified = true;
+		}
+		else if (RootComponent != nullptr)
+		{
+			// If we are attached, don't replicate absolute position, use AttachmentReplication instead.
+			if (RootComponent->GetAttachParent() != nullptr)
+			{
+				// Networking for attachments assumes the RootComponent of the AttachParent actor. 
+				// If that's not the case, we can't update this, as the client wouldn't be able to resolve the Component and would detach as a result.
+				AttachmentWeldReplication.AttachParent = RootComponent->GetAttachParent()->GetAttachmentRootActor();
+				if (AttachmentWeldReplication.AttachParent != nullptr)
+				{
+					AttachmentWeldReplication.LocationOffset = RootComponent->GetRelativeLocation();
+					AttachmentWeldReplication.RotationOffset = RootComponent->GetRelativeRotation();
+					AttachmentWeldReplication.RelativeScale3D = RootComponent->GetRelativeScale3D();
+					AttachmentWeldReplication.AttachComponent = RootComponent->GetAttachParent();
+					AttachmentWeldReplication.AttachSocket = RootComponent->GetAttachSocketName();
+					AttachmentWeldReplication.bIsWelded = RootPrimComp ? RootPrimComp->IsWelded() : false;
+
+					// Technically, the values might have stayed the same, but we'll just assume they've changed.
+					bWasAttachmentModified = true;
+				}
+			}
+			else
+			{
+				RepMovement.Location = FRepMovement::RebaseOntoZeroOrigin(RootComponent->GetComponentLocation(), this);
+				RepMovement.Rotation = RootComponent->GetComponentRotation();
+				RepMovement.LinearVelocity = GetVelocity();
+				RepMovement.AngularVelocity = FVector::ZeroVector;
+
+				// Technically, the values might have stayed the same, but we'll just assume they've changed.
+				bWasRepMovementModified = true;
+			}
+
+			bWasRepMovementModified = (bWasRepMovementModified || RepMovement.bRepPhysics);
+			RepMovement.bRepPhysics = false;
+		}
+#if WITH_PUSH_MODEL
+		if (bWasRepMovementModified)
+		{
+			//MARK_PROPERTY_DIRTY_FROM_NAME(AActor, ReplicatedMovement, this);
+		}
+
+		if (bWasAttachmentModified ||
+			OldAttachParent != AttachmentWeldReplication.AttachParent ||
+			OldAttachComponent != AttachmentWeldReplication.AttachComponent)
+		{
+			//MARK_PROPERTY_DIRTY_FROM_NAME(AGrippableSkeletalMeshActor, AttachmentWeldReplication, this);
+		}
+#endif
+	}
+}
+
+bool AGrippableSkeletalMeshActor::ReplicateSubobjects(UActorChannel* Channel, class FOutBunch* Bunch, FReplicationFlags* RepFlags)
 {
 	bool WroteSomething = Super::ReplicateSubobjects(Channel, Bunch, RepFlags);
 
@@ -128,21 +270,26 @@ void AGrippableSkeletalMeshActor::SetDenyGripping(bool bDenyGripping)
 	VRGripInterfaceSettings.bDenyGripping = bDenyGripping;
 }
 
-void AGrippableSkeletalMeshActor::TickGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation, float DeltaTime) {}
-void AGrippableSkeletalMeshActor::OnGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation) {}
-void AGrippableSkeletalMeshActor::OnGripRelease_Implementation(UGripMotionControllerComponent * ReleasingController, const FBPActorGripInformation & GripInformation, bool bWasSocketed) {}
-void AGrippableSkeletalMeshActor::OnChildGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation) {}
-void AGrippableSkeletalMeshActor::OnChildGripRelease_Implementation(UGripMotionControllerComponent * ReleasingController, const FBPActorGripInformation & GripInformation, bool bWasSocketed) {}
-void AGrippableSkeletalMeshActor::OnSecondaryGrip_Implementation(UGripMotionControllerComponent * GripOwningController, USceneComponent * SecondaryGripComponent, const FBPActorGripInformation & GripInformation) {}
-void AGrippableSkeletalMeshActor::OnSecondaryGripRelease_Implementation(UGripMotionControllerComponent * GripOwningController, USceneComponent * ReleasingSecondaryGripComponent, const FBPActorGripInformation & GripInformation) {}
+void AGrippableSkeletalMeshActor::SetGripPriority(int NewGripPriority)
+{
+	VRGripInterfaceSettings.AdvancedGripSettings.GripPriority = NewGripPriority;
+}
+
+void AGrippableSkeletalMeshActor::TickGrip_Implementation(UGripMotionControllerComponent* GrippingController, const FBPActorGripInformation& GripInformation, float DeltaTime) {}
+void AGrippableSkeletalMeshActor::OnGrip_Implementation(UGripMotionControllerComponent* GrippingController, const FBPActorGripInformation& GripInformation) { OnGripped.Broadcast(GrippingController, GripInformation); }
+void AGrippableSkeletalMeshActor::OnGripRelease_Implementation(UGripMotionControllerComponent* ReleasingController, const FBPActorGripInformation& GripInformation, bool bWasSocketed) { OnDropped.Broadcast(ReleasingController, GripInformation, bWasSocketed); }
+void AGrippableSkeletalMeshActor::OnChildGrip_Implementation(UGripMotionControllerComponent* GrippingController, const FBPActorGripInformation& GripInformation) {}
+void AGrippableSkeletalMeshActor::OnChildGripRelease_Implementation(UGripMotionControllerComponent* ReleasingController, const FBPActorGripInformation& GripInformation, bool bWasSocketed) {}
+void AGrippableSkeletalMeshActor::OnSecondaryGrip_Implementation(UGripMotionControllerComponent* GripOwningController, USceneComponent* SecondaryGripComponent, const FBPActorGripInformation& GripInformation) { OnSecondaryGripAdded.Broadcast(GripOwningController, GripInformation); }
+void AGrippableSkeletalMeshActor::OnSecondaryGripRelease_Implementation(UGripMotionControllerComponent* GripOwningController, USceneComponent* ReleasingSecondaryGripComponent, const FBPActorGripInformation& GripInformation) { OnSecondaryGripRemoved.Broadcast(GripOwningController, GripInformation); }
 void AGrippableSkeletalMeshActor::OnUsed_Implementation() {}
 void AGrippableSkeletalMeshActor::OnEndUsed_Implementation() {}
 void AGrippableSkeletalMeshActor::OnSecondaryUsed_Implementation() {}
 void AGrippableSkeletalMeshActor::OnEndSecondaryUsed_Implementation() {}
 void AGrippableSkeletalMeshActor::OnInput_Implementation(FKey Key, EInputEvent KeyEvent) {}
-bool AGrippableSkeletalMeshActor::RequestsSocketing_Implementation(USceneComponent *& ParentToSocketTo, FName & OptionalSocketName, FTransform_NetQuantize & RelativeTransform) { return false; }
+bool AGrippableSkeletalMeshActor::RequestsSocketing_Implementation(USceneComponent*& ParentToSocketTo, FName& OptionalSocketName, FTransform_NetQuantize& RelativeTransform) { return false; }
 
-bool AGrippableSkeletalMeshActor::DenyGripping_Implementation()
+bool AGrippableSkeletalMeshActor::DenyGripping_Implementation(UGripMotionControllerComponent * GripInitiator)
 {
 	return VRGripInterfaceSettings.bDenyGripping;
 }
@@ -178,7 +325,7 @@ EGripLateUpdateSettings AGrippableSkeletalMeshActor::GripLateUpdateSetting_Imple
 	return VRGripInterfaceSettings.LateUpdateSetting;
 }
 
-void AGrippableSkeletalMeshActor::GetGripStiffnessAndDamping_Implementation(float &GripStiffnessOut, float &GripDampingOut)
+void AGrippableSkeletalMeshActor::GetGripStiffnessAndDamping_Implementation(float& GripStiffnessOut, float& GripDampingOut)
 {
 	GripStiffnessOut = VRGripInterfaceSettings.ConstraintStiffness;
 	GripDampingOut = VRGripInterfaceSettings.ConstraintDamping;
@@ -194,12 +341,12 @@ float AGrippableSkeletalMeshActor::GripBreakDistance_Implementation()
 	return VRGripInterfaceSettings.ConstraintBreakDistance;
 }
 
-void AGrippableSkeletalMeshActor::ClosestGripSlotInRange_Implementation(FVector WorldLocation, bool bSecondarySlot, bool & bHadSlotInRange, FTransform & SlotWorldTransform, UGripMotionControllerComponent * CallingController, FName OverridePrefix)
+void AGrippableSkeletalMeshActor::ClosestGripSlotInRange_Implementation(FVector WorldLocation, bool bSecondarySlot, bool& bHadSlotInRange, FTransform& SlotWorldTransform, FName& SlotName, UGripMotionControllerComponent* CallingController, FName OverridePrefix)
 {
 	if (OverridePrefix.IsNone())
 		bSecondarySlot ? OverridePrefix = "VRGripS" : OverridePrefix = "VRGripP";
 
-	UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName(OverridePrefix, this, WorldLocation, bSecondarySlot ? VRGripInterfaceSettings.SecondarySlotRange : VRGripInterfaceSettings.PrimarySlotRange, bHadSlotInRange, SlotWorldTransform);
+	UVRExpansionFunctionLibrary::GetGripSlotInRangeByTypeName(OverridePrefix, this, WorldLocation, bSecondarySlot ? VRGripInterfaceSettings.SecondarySlotRange : VRGripInterfaceSettings.PrimarySlotRange, bHadSlotInRange, SlotWorldTransform, SlotName, CallingController);
 }
 
 bool AGrippableSkeletalMeshActor::AllowsMultipleGrips_Implementation()
@@ -207,7 +354,7 @@ bool AGrippableSkeletalMeshActor::AllowsMultipleGrips_Implementation()
 	return VRGripInterfaceSettings.bAllowMultipleGrips;
 }
 
-void AGrippableSkeletalMeshActor::IsHeld_Implementation(TArray<FBPGripPair> & HoldingControllers, bool & bIsHeld)
+void AGrippableSkeletalMeshActor::IsHeld_Implementation(TArray<FBPGripPair>& HoldingControllers, bool& bIsHeld)
 {
 	HoldingControllers = VRGripInterfaceSettings.HoldingControllers;
 	bIsHeld = VRGripInterfaceSettings.bIsHeld;
@@ -221,7 +368,7 @@ bool AGrippableSkeletalMeshActor::AddToClientReplicationBucket()
 		GEngine->GetEngineSubsystem<UBucketUpdateSubsystem>()->AddObjectToBucket(ClientAuthReplicationData.UpdateRate, this, FName(TEXT("PollReplicationEvent")));
 		ClientAuthReplicationData.bIsCurrentlyClientAuth = true;
 
-		if (UWorld * World = GetWorld())
+		if (UWorld* World = GetWorld())
 			ClientAuthReplicationData.TimeAtInitialThrow = World->GetTimeSeconds();
 
 		return true;
@@ -250,23 +397,28 @@ void AGrippableSkeletalMeshActor::SetHeld_Implementation(UGripMotionControllerCo
 		RemoveFromClientReplicationBucket();
 
 		VRGripInterfaceSettings.bWasHeld = true;
+		VRGripInterfaceSettings.bIsHeld = VRGripInterfaceSettings.HoldingControllers.Num() > 0;
 	}
 	else
 	{
 		VRGripInterfaceSettings.HoldingControllers.Remove(FBPGripPair(HoldingController, GripID));
-		if (ClientAuthReplicationData.bUseClientAuthThrowing && ShouldWeSkipAttachmentReplication(false))
+		VRGripInterfaceSettings.bIsHeld = VRGripInterfaceSettings.HoldingControllers.Num() > 0;
+
+		if (ClientAuthReplicationData.bUseClientAuthThrowing && !VRGripInterfaceSettings.bIsHeld)
 		{
-			if (UPrimitiveComponent * PrimComp = Cast<UPrimitiveComponent>(GetRootComponent()))
+			bool bWasLocallyOwned = HoldingController ? HoldingController->IsLocallyControlled() : false;
+			if (bWasLocallyOwned && ShouldWeSkipAttachmentReplication(false))
 			{
-				if (PrimComp->IsSimulatingPhysics())
+				if (UPrimitiveComponent* PrimComp = Cast<UPrimitiveComponent>(GetRootComponent()))
 				{
-					AddToClientReplicationBucket();
+					if (PrimComp->IsSimulatingPhysics())
+					{
+						AddToClientReplicationBucket();
+					}
 				}
 			}
 		}
 	}
-
-	VRGripInterfaceSettings.bIsHeld = VRGripInterfaceSettings.HoldingControllers.Num() > 0;
 }
 
 /*FBPInteractionSettings AGrippableSkeletalMeshActor::GetInteractionSettings_Implementation()
@@ -274,7 +426,7 @@ void AGrippableSkeletalMeshActor::SetHeld_Implementation(UGripMotionControllerCo
 	return VRGripInterfaceSettings.InteractionSettings;
 }*/
 
-bool AGrippableSkeletalMeshActor::GetGripScripts_Implementation(TArray<UVRGripScriptBase*> & ArrayReference)
+bool AGrippableSkeletalMeshActor::GetGripScripts_Implementation(TArray<UVRGripScriptBase*>& ArrayReference)
 {
 	ArrayReference = GripLogicScripts;
 	return GripLogicScripts.Num() > 0;
@@ -282,58 +434,68 @@ bool AGrippableSkeletalMeshActor::GetGripScripts_Implementation(TArray<UVRGripSc
 
 bool AGrippableSkeletalMeshActor::PollReplicationEvent()
 {
-	if (!ClientAuthReplicationData.bIsCurrentlyClientAuth)
-		return false;
+	if (!ClientAuthReplicationData.bIsCurrentlyClientAuth || !this->HasLocalNetOwner() || VRGripInterfaceSettings.bIsHeld)
+		return false; // Tell the bucket subsystem to remove us from consideration
 
-	UWorld *OurWorld = GetWorld();
+	UWorld* OurWorld = GetWorld();
 	if (!OurWorld)
-		return false;
+		return false; // Tell the bucket subsystem to remove us from consideration
+
+	bool bRemoveBlocking = false;
 
 	if ((OurWorld->GetTimeSeconds() - ClientAuthReplicationData.TimeAtInitialThrow) > 10.0f)
 	{
 		// Lets time out sending, its been 10 seconds since we threw the object and its likely that it is conflicting with some server
 		// Authed movement that is forcing it to keep momentum.
-		return false;
+		//return false; // Tell the bucket subsystem to remove us from consideration
+		bRemoveBlocking = true;
 	}
 
 	// Store current transform for resting check
 	FTransform CurTransform = this->GetActorTransform();
 
-	if (!CurTransform.GetRotation().Equals(ClientAuthReplicationData.LastActorTransform.GetRotation()) || !CurTransform.GetLocation().Equals(ClientAuthReplicationData.LastActorTransform.GetLocation()))
+	if (!bRemoveBlocking)
 	{
-		ClientAuthReplicationData.LastActorTransform = CurTransform;
-
-		if (UPrimitiveComponent * PrimComp = Cast<UPrimitiveComponent>(RootComponent))
+		if (!CurTransform.GetRotation().Equals(ClientAuthReplicationData.LastActorTransform.GetRotation()) || !CurTransform.GetLocation().Equals(ClientAuthReplicationData.LastActorTransform.GetLocation()))
 		{
-			// Need to clamp to a max time since start, to handle cases with conflicting collisions
-			if (PrimComp->IsSimulatingPhysics() && ShouldWeSkipAttachmentReplication(false))
-			{
-				FRepMovementVR ClientAuthMovementRep;
-				if (ClientAuthMovementRep.GatherActorsMovement(this))
-				{
-					Server_GetClientAuthReplication(ClientAuthMovementRep);
+			ClientAuthReplicationData.LastActorTransform = CurTransform;
 
-					if (PrimComp->RigidBodyIsAwake())
-						return true;
+			if (UPrimitiveComponent* PrimComp = Cast<UPrimitiveComponent>(RootComponent))
+			{
+				// Need to clamp to a max time since start, to handle cases with conflicting collisions
+				if (PrimComp->IsSimulatingPhysics() && ShouldWeSkipAttachmentReplication(false))
+				{
+					FRepMovementVR ClientAuthMovementRep;
+					if (ClientAuthMovementRep.GatherActorsMovement(this))
+					{
+						Server_GetClientAuthReplication(ClientAuthMovementRep);
+
+						if (PrimComp->RigidBodyIsAwake())
+						{
+							return true;
+						}
+					}
 				}
 			}
+			else
+			{
+				bRemoveBlocking = true;
+				//return false; // Tell the bucket subsystem to remove us from consideration
+			}
 		}
-		else
-		{
-			return false;
-		}
+		//else
+	//	{
+			// Difference is too small, lets end sending location
+			//ClientAuthReplicationData.LastActorTransform = FTransform::Identity;
+	//	}
 	}
-	else
-	{
-		// Difference is too small, lets end sending location
-		ClientAuthReplicationData.LastActorTransform = FTransform::Identity;
-	}
+
+	bool TimedBlockingRelease = false;
 
 	AActor* TopOwner = GetOwner();
-
 	if (TopOwner != nullptr)
 	{
-		AActor * tempOwner = TopOwner->GetOwner();
+		AActor* tempOwner = TopOwner->GetOwner();
 
 		// I have an owner so search that for the top owner
 		while (tempOwner)
@@ -354,11 +516,19 @@ bool AGrippableSkeletalMeshActor::PollReplicationEvent()
 				// Lets clamp the ping to a min / max value just in case
 				float clampedPing = FMath::Clamp(PlayerState->ExactPing * 0.001f, 0.0f, 1000.0f);
 				OurWorld->GetTimerManager().SetTimer(ClientAuthReplicationData.ResetReplicationHandle, this, &AGrippableSkeletalMeshActor::CeaseReplicationBlocking, clampedPing, false);
+				TimedBlockingRelease = true;
 			}
 		}
 	}
 
-	return false;
+	if (!TimedBlockingRelease)
+	{
+		CeaseReplicationBlocking();
+	}
+
+	// Tell server to kill us
+	Server_EndClientAuthReplication();
+	return false; // Tell the bucket subsystem to remove us from consideration
 }
 
 void AGrippableSkeletalMeshActor::CeaseReplicationBlocking()
@@ -366,9 +536,11 @@ void AGrippableSkeletalMeshActor::CeaseReplicationBlocking()
 	if (ClientAuthReplicationData.bIsCurrentlyClientAuth)
 		ClientAuthReplicationData.bIsCurrentlyClientAuth = false;
 
+	ClientAuthReplicationData.LastActorTransform = FTransform::Identity;
+
 	if (ClientAuthReplicationData.ResetReplicationHandle.IsValid())
 	{
-		if (UWorld * OurWorld = GetWorld())
+		if (UWorld* OurWorld = GetWorld())
 		{
 			OurWorld->GetTimerManager().ClearTimer(ClientAuthReplicationData.ResetReplicationHandle);
 		}
@@ -391,17 +563,38 @@ void AGrippableSkeletalMeshActor::EndPlay(const EEndPlayReason::Type EndPlayReas
 	Super::EndPlay(EndPlayReason);
 }
 
-
-bool AGrippableSkeletalMeshActor::Server_GetClientAuthReplication_Validate(const FRepMovementVR & newMovement)
+bool AGrippableSkeletalMeshActor::Server_EndClientAuthReplication_Validate()
 {
 	return true;
 }
 
-void AGrippableSkeletalMeshActor::Server_GetClientAuthReplication_Implementation(const FRepMovementVR & newMovement)
+void AGrippableSkeletalMeshActor::Server_EndClientAuthReplication_Implementation()
 {
-	FRepMovement& MovementRep = GetReplicatedMovement_Mutable();
-	newMovement.CopyTo(MovementRep);
-	OnRep_ReplicatedMovement();
+	if (UWorld* World = GetWorld())
+	{
+		if (FPhysScene* PhysScene = World->GetPhysicsScene())
+		{
+			if (FPhysicsReplication* PhysicsReplication = PhysScene->GetPhysicsReplication())
+			{
+				PhysicsReplication->RemoveReplicatedTarget(this->GetSkeletalMeshComponent());
+			}
+		}
+	}
+}
+
+bool AGrippableSkeletalMeshActor::Server_GetClientAuthReplication_Validate(const FRepMovementVR& newMovement)
+{
+	return true;
+}
+
+void AGrippableSkeletalMeshActor::Server_GetClientAuthReplication_Implementation(const FRepMovementVR& newMovement)
+{
+	if (!VRGripInterfaceSettings.bIsHeld)
+	{
+		FRepMovement& MovementRep = GetReplicatedMovement_Mutable();
+		newMovement.CopyTo(MovementRep);
+		OnRep_ReplicatedMovement();
+	}
 }
 
 void AGrippableSkeletalMeshActor::OnRep_AttachmentReplication()
@@ -411,13 +604,54 @@ void AGrippableSkeletalMeshActor::OnRep_AttachmentReplication()
 		return;
 	}
 
-	// None of our overrides are required, lets just pass it on now
-	Super::OnRep_AttachmentReplication();
+	if (AttachmentWeldReplication.AttachParent)
+	{
+		if (RootComponent)
+		{
+			USceneComponent* AttachParentComponent = (AttachmentWeldReplication.AttachComponent ? AttachmentWeldReplication.AttachComponent : AttachmentWeldReplication.AttachParent->GetRootComponent());
+
+			if (AttachParentComponent)
+			{
+				RootComponent->SetRelativeLocation_Direct(AttachmentWeldReplication.LocationOffset);
+				RootComponent->SetRelativeRotation_Direct(AttachmentWeldReplication.RotationOffset);
+				RootComponent->SetRelativeScale3D_Direct(AttachmentWeldReplication.RelativeScale3D);
+
+				// If we're already attached to the correct Parent and Socket, then the update must be position only.
+				// AttachToComponent would early out in this case.
+				// Note, we ignore the special case for simulated bodies in AttachToComponent as AttachmentReplication shouldn't get updated
+				// if the body is simulated (see AActor::GatherMovement).
+				const bool bAlreadyAttached = (AttachParentComponent == RootComponent->GetAttachParent() && AttachmentWeldReplication.AttachSocket == RootComponent->GetAttachSocketName() && AttachParentComponent->GetAttachChildren().Contains(RootComponent));
+				if (bAlreadyAttached)
+				{
+					// Note, this doesn't match AttachToComponent, but we're assuming it's safe to skip physics (see comment above).
+					RootComponent->UpdateComponentToWorld(EUpdateTransformFlags::SkipPhysicsUpdate, ETeleportType::None);
+				}
+				else
+				{
+					FAttachmentTransformRules attachRules = FAttachmentTransformRules::KeepRelativeTransform;
+					attachRules.bWeldSimulatedBodies = AttachmentWeldReplication.bIsWelded;
+					RootComponent->AttachToComponent(AttachParentComponent, attachRules, AttachmentWeldReplication.AttachSocket);
+				}
+			}
+		}
+	}
+	else
+	{
+		DetachFromActor(FDetachmentTransformRules::KeepWorldTransform);
+
+		// Handle the case where an object was both detached and moved on the server in the same frame.
+		// Calling this extraneously does not hurt but will properly fire events if the movement state changed while attached.
+		// This is needed because client side movement is ignored when attached
+		if (IsReplicatingMovement())
+		{
+			OnRep_ReplicatedMovement();
+		}
+	}
 }
 
 void AGrippableSkeletalMeshActor::OnRep_ReplicateMovement()
 {
-	if (bAllowIgnoringAttachOnOwner && ShouldWeSkipAttachmentReplication())
+	if (bAllowIgnoringAttachOnOwner && (ClientAuthReplicationData.bIsCurrentlyClientAuth || ShouldWeSkipAttachmentReplication()))
 	{
 		return;
 	}
@@ -457,7 +691,7 @@ void AGrippableSkeletalMeshActor::OnRep_ReplicatedMovement()
 
 void AGrippableSkeletalMeshActor::PostNetReceivePhysicState()
 {
-	if (VRGripInterfaceSettings.bIsHeld && bAllowIgnoringAttachOnOwner && ShouldWeSkipAttachmentReplication(false))
+	if ((ClientAuthReplicationData.bIsCurrentlyClientAuth || VRGripInterfaceSettings.bIsHeld) && bAllowIgnoringAttachOnOwner && ShouldWeSkipAttachmentReplication(false))
 	{
 		return;
 	}
@@ -471,7 +705,7 @@ void AGrippableSkeletalMeshActor::MarkComponentsAsPendingKill()
 
 	for (int32 i = 0; i < GripLogicScripts.Num(); ++i)
 	{
-		if (UObject *SubObject = GripLogicScripts[i])
+		if (UObject* SubObject = GripLogicScripts[i])
 		{
 			SubObject->MarkPendingKill();
 		}
@@ -487,7 +721,7 @@ void AGrippableSkeletalMeshActor::PreDestroyFromReplication()
 	// Destroy any sub-objects we created
 	for (int32 i = 0; i < GripLogicScripts.Num(); ++i)
 	{
-		if (UObject *SubObject = GripLogicScripts[i])
+		if (UObject* SubObject = GripLogicScripts[i])
 		{
 			OnSubobjectDestroyFromReplication(SubObject); //-V595
 			SubObject->PreDestroyFromReplication();
@@ -495,7 +729,7 @@ void AGrippableSkeletalMeshActor::PreDestroyFromReplication()
 		}
 	}
 
-	for (UActorComponent * ActorComp : GetComponents())
+	for (UActorComponent* ActorComp : GetComponents())
 	{
 		// Pending kill components should have already had this called as they were network spawned and are being killed
 		if (ActorComp && !ActorComp->IsPendingKill() && ActorComp->GetClass()->ImplementsInterface(UVRGripInterface::StaticClass()))
@@ -511,7 +745,7 @@ void AGrippableSkeletalMeshActor::BeginDestroy()
 
 	for (int32 i = 0; i < GripLogicScripts.Num(); i++)
 	{
-		if (UObject *SubObject = GripLogicScripts[i])
+		if (UObject* SubObject = GripLogicScripts[i])
 		{
 			SubObject->MarkPendingKill();
 		}

@@ -8,7 +8,7 @@
 #include "PhysicsPublic.h"
 #include "PhysicsEngine/ConstraintDrives.h"
 
-#if WITH_PHYSX
+#if PHYSICS_INTERFACE_PHYSX
 //#include "PhysXPublic.h"
 //#include "PhysicsEngine/PhysXSupport.h"
 #endif // WITH_PHYSX
@@ -117,38 +117,95 @@ public:
 
 };
 
+
+/** Different methods for interpolating rotation between transforms */
+UENUM(BlueprintType)
+enum class EVRLerpInterpolationMode : uint8
+{
+	/** Shortest Path or Quaternion interpolation for the rotation. */
+	QuatInterp,
+
+	/** Rotor or Euler Angle interpolation. */
+	EulerInterp,
+
+	/** Dual quaternion interpolation, follows helix or screw-motion path between keyframes.   */
+	DualQuatInterp
+};
+
+template<class filterType>
 class FBasicLowPassFilter
 {
 public:
 
 	/** Default constructor */
-	FBasicLowPassFilter() :
-		Previous(FVector::ZeroVector),
-		bFirstTime(true)
-	{}
+	FBasicLowPassFilter(filterType EmptyValueSet)
+	{
+		EmptyValue = EmptyValueSet;
+		Previous = EmptyValue;
+		PreviousRaw = EmptyValue;
+		bFirstTime = true;
+	}
 
 	/** Calculate */
-	FVector Filter(const FVector& InValue, const FVector& InAlpha)
+	filterType Filter(const filterType& InValue, const filterType& InAlpha)
 	{
-		FVector Result = InValue;
+
+		filterType Result = InValue;
 		if (!bFirstTime)
 		{
-			for (int i = 0; i < 3; i++)
+			// This is unsafe in non float / float array data types, but I am not going to be using any like that
+			for (int i = 0; i < sizeof(filterType)/sizeof(float); i++)
 			{
-				Result[i] = InAlpha[i] * InValue[i] + (1 - InAlpha[i]) * Previous[i];
+				((float*)&Result)[i] = ((float*)&InAlpha)[i] * ((float*)&InValue)[i] + (1.0f - ((float*)&InAlpha)[i]) * ((float*)&Previous)[i];
 			}
 		}
 
 		bFirstTime = false;
 		Previous = Result;
+		PreviousRaw = InValue;
 		return Result;
 	}
 
+	filterType EmptyValue;
+
 	/** The previous filtered value */
-	FVector Previous;
+	filterType Previous;
+
+	/** The previous raw value */
+	filterType PreviousRaw;
 
 	/** If this is the first time doing a filter */
 	bool bFirstTime;
+
+//private:
+
+	const filterType CalculateCutoff(const filterType& InValue, float& MinCutoff, float& CutoffSlope)
+	{
+		filterType Result;
+		// This is unsafe in non float / float array data types, but I am not going to be using any like that
+		for (int i = 0; i < sizeof(filterType)/sizeof(float); i++)
+		{
+			((float*)&Result)[i] = MinCutoff + CutoffSlope * FMath::Abs(((float*)&InValue)[i]);
+		}
+		return Result;
+	}
+
+	const filterType CalculateAlpha(const filterType& InCutoff, const double InDeltaTime)
+	{
+		filterType Result;
+		// This is unsafe in non float / float array data types, but I am not going to be using any like that
+		for (int i = 0; i < sizeof(filterType)/sizeof(float); i++)
+		{
+			((float*)&Result)[i] = CalculateAlphaTau(((float*)&InCutoff)[i], InDeltaTime);
+		}
+		return Result;
+	}
+
+	inline const float CalculateAlphaTau(const float InCutoff, const double InDeltaTime)
+	{
+		const float tau = 1.0 / (2.0f * PI * InCutoff);
+		return 1.0f / (1.0f + tau / InDeltaTime);
+	}
 };
 
 
@@ -167,13 +224,17 @@ public:
 	FBPEuroLowPassFilter() :
 		MinCutoff(0.9f),
 		DeltaCutoff(1.0f),
-		CutoffSlope(0.007f)
+		CutoffSlope(0.007f),
+		RawFilter(FVector::ZeroVector),
+		DeltaFilter(FVector::ZeroVector)
 	{}
 
 	FBPEuroLowPassFilter(const float InMinCutoff, const float InCutoffSlope, const float InDeltaCutoff) :
 		MinCutoff(InMinCutoff),
 		DeltaCutoff(InDeltaCutoff),
-		CutoffSlope(InCutoffSlope)
+		CutoffSlope(InCutoffSlope),
+		RawFilter(FVector::ZeroVector),
+		DeltaFilter(FVector::ZeroVector)
 	{}
 
 	// The smaller the value the less jitter and the more lag with micro movements
@@ -196,13 +257,195 @@ public:
 
 private:
 
-	const FVector CalculateCutoff(const FVector& InValue);
-	const FVector CalculateAlpha(const FVector& InCutoff, const double InDeltaTime) const;
-	const float CalculateAlpha(const float InCutoff, const double InDeltaTime) const;
+	FBasicLowPassFilter<FVector> RawFilter;
+	FBasicLowPassFilter<FVector> DeltaFilter;
 
-	FBasicLowPassFilter RawFilter;
-	FBasicLowPassFilter DeltaFilter;
+};
 
+/************************************************************************/
+/* 1 Euro filter smoothing algorithm									*/
+/* http://cristal.univ-lille.fr/~casiez/1euro/							*/
+/************************************************************************/
+// A re-implementation of the Euro Low Pass Filter that epic uses for the VR Editor, but for blueprints
+// This version is for Quaternions
+USTRUCT(BlueprintType, Category = "VRExpansionLibrary")
+struct VREXPANSIONPLUGIN_API FBPEuroLowPassFilterQuat
+{
+	GENERATED_BODY()
+public:
+
+	/** Default constructor */
+	FBPEuroLowPassFilterQuat() :
+		MinCutoff(0.9f),
+		DeltaCutoff(1.0f),
+		CutoffSlope(0.007f),
+		RawFilter(FQuat::Identity),
+		DeltaFilter(FQuat::Identity)
+	{}
+
+	FBPEuroLowPassFilterQuat(const float InMinCutoff, const float InCutoffSlope, const float InDeltaCutoff) :
+		MinCutoff(InMinCutoff),
+		DeltaCutoff(InDeltaCutoff),
+		CutoffSlope(InCutoffSlope),
+		RawFilter(FQuat::Identity),
+		DeltaFilter(FQuat::Identity)
+	{}
+
+	// The smaller the value the less jitter and the more lag with micro movements
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "FilterSettings")
+		float MinCutoff;
+
+	// If latency is too high with fast movements increase this value
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "FilterSettings")
+		float DeltaCutoff;
+
+	// This is the magnitude of adjustment
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "FilterSettings")
+		float CutoffSlope;
+
+	void ResetSmoothingFilter();
+
+	/** Smooth vector */
+	FQuat RunFilterSmoothing(const FQuat& InRawValue, const float& InDeltaTime);
+
+private:
+
+	FBasicLowPassFilter<FQuat> RawFilter;
+	FBasicLowPassFilter<FQuat> DeltaFilter;
+
+};
+
+/************************************************************************/
+/* 1 Euro filter smoothing algorithm									*/
+/* http://cristal.univ-lille.fr/~casiez/1euro/							*/
+/************************************************************************/
+// A re-implementation of the Euro Low Pass Filter that epic uses for the VR Editor, but for blueprints
+// This version is for Transforms
+USTRUCT(BlueprintType, Category = "VRExpansionLibrary")
+struct VREXPANSIONPLUGIN_API FBPEuroLowPassFilterTrans
+{
+	GENERATED_BODY()
+public:
+
+	/** Default constructor */
+	FBPEuroLowPassFilterTrans() :
+		MinCutoff(0.1f),
+		DeltaCutoff(10.0f),
+		CutoffSlope(10.0f),
+		RawFilter(FTransform::Identity),
+		DeltaFilter(FTransform::Identity)
+	{}
+
+	FBPEuroLowPassFilterTrans(const float InMinCutoff, const float InCutoffSlope, const float InDeltaCutoff) :
+		MinCutoff(InMinCutoff),
+		DeltaCutoff(InDeltaCutoff),
+		CutoffSlope(InCutoffSlope),
+		RawFilter(FTransform::Identity),
+		DeltaFilter(FTransform::Identity)
+	{}
+
+	// The smaller the value the less jitter and the more lag with micro movements
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "FilterSettings")
+		float MinCutoff;
+
+	// If latency is too high with fast movements increase this value
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "FilterSettings")
+		float DeltaCutoff;
+
+	// This is the magnitude of adjustment
+	UPROPERTY(BlueprintReadWrite, EditAnywhere, Category = "FilterSettings")
+		float CutoffSlope;
+
+	void ResetSmoothingFilter();
+
+	/** Smooth vector */
+	FTransform RunFilterSmoothing(const FTransform& InRawValue, const float& InDeltaTime);
+
+private:
+
+	FBasicLowPassFilter<FTransform> RawFilter;
+	FBasicLowPassFilter<FTransform> DeltaFilter;
+
+};
+
+// The type of velocity tracking to perform on the motion controllers
+UENUM(BlueprintType)
+enum class EVRVelocityType : uint8
+{
+	// Gets the frame by frame velocity
+	VRLOCITY_Default UMETA(DisplayName = "Default"),
+
+	// Gets a running average velocity across a sample duration
+	VRLOCITY_RunningAverage  UMETA(DisplayName = "Running Average"),
+
+	// Gets the peak velocity across a sample duration
+	VRLOCITY_SamplePeak UMETA(DisplayName = "Sampled Peak")
+};
+
+// A structure used to store and calculate velocities in different ways
+USTRUCT(BlueprintType, Category = "VRExpansionLibrary")
+struct VREXPANSIONPLUGIN_API FBPLowPassPeakFilter
+{
+	GENERATED_BODY()
+public:
+
+	/** Default constructor */
+	FBPLowPassPeakFilter() :
+		VelocitySamples(30),
+		VelocitySampleLogCounter(0)
+	{}
+
+	// This is the number of samples to keep active
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Samples")
+		int32 VelocitySamples;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Samples")
+	TArray<FVector>VelocitySampleLog;
+	
+	int32 VelocitySampleLogCounter;
+
+	void Reset()
+	{
+		VelocitySampleLog.Reset(VelocitySamples);
+	}
+
+	void AddSample(FVector NewSample)
+	{
+		if (VelocitySamples <= 0)
+			return;
+
+		if (VelocitySampleLog.Num() != VelocitySamples)
+		{
+			VelocitySampleLog.Reset(VelocitySamples);
+			VelocitySampleLog.AddZeroed(VelocitySamples);
+			VelocitySampleLogCounter = 0;
+		}
+
+		VelocitySampleLog[VelocitySampleLogCounter] = NewSample;
+		++VelocitySampleLogCounter;
+
+		if (VelocitySampleLogCounter >= VelocitySamples)
+			VelocitySampleLogCounter = 0;
+	}
+
+	FVector GetPeak() const
+	{
+		FVector MaxValue = FVector::ZeroVector;
+		float ValueSizeSq = 0.f;
+		float CurSizeSq = 0.f;
+
+		for (int i = 0; i < VelocitySampleLog.Num(); i++)
+		{
+			CurSizeSq = VelocitySampleLog[i].SizeSquared();
+			if (CurSizeSq > ValueSizeSq)
+			{
+				MaxValue = VelocitySampleLog[i];
+				ValueSizeSq = CurSizeSq;
+			}
+		}
+
+		return MaxValue;
+	}
 };
 
 // Some static vars so we don't have to keep calculating these for our Smallest Three compression
@@ -774,6 +1017,7 @@ UENUM(Blueprintable)
 enum class EPhysicsGripConstraintType : uint8
 {
 	AccelerationConstraint = 0,
+	// Not available when not using Physx
 	ForceConstraint = 1
 };
 
@@ -801,6 +1045,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings")
 		bool bUsePhysicsSettings;
 
+	// Not available outside of physx, chaos has no force constraints and other plugin physics engines may not as well
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (editcondition = "bUsePhysicsSettings"))
 		EPhysicsGripConstraintType PhysicsConstraintType;
 
@@ -812,16 +1057,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (editcondition = "bUsePhysicsSettings"))
 		bool bTurnOffGravityDuringGrip;
 
+	// Don't automatically (un)simulate the component/root on grip/drop, let the end user set it up instead
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (editcondition = "bUsePhysicsSettings"))
+		bool bSkipSettingSimulating;
+
 	// A multiplier to add to the stiffness of a grip that is then set as the MaxForce of the grip
 	// It is clamped between 0.00 and 256.00 to save in replication cost, a value of 0 will mean max force is infinite as it will multiply it to zero (legacy behavior)
 	// If you want an exact value you can figure it out as a factor of the stiffness, also Max force can be directly edited with SetAdvancedConstraintSettings
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (editcondition = "bUsePhysicsSettings"), meta = (ClampMin = "0.00", UIMin = "0.00", ClampMax = "256.00", UIMax = "32.00"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (editcondition = "bUsePhysicsSettings"), meta = (ClampMin = "0.00", UIMin = "0.00", ClampMax = "256.00", UIMax = "256.00"))
 		float LinearMaxForceCoefficient;
 
 	// A multiplier to add to the stiffness of a grip that is then set as the MaxForce of the grip
 	// It is clamped between 0.00 and 256.00 to save in replication cost, a value of 0 will mean max force is infinite as it will multiply it to zero (legacy behavior)
 	// If you want an exact value you can figure it out as a factor of the stiffness, also Max force can be directly edited with SetAdvancedConstraintSettings
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (editcondition = "bUsePhysicsSettings"), meta = (ClampMin = "0.00", UIMin = "0.00", ClampMax = "256.00", UIMax = "32.00"))
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (editcondition = "bUsePhysicsSettings"), meta = (ClampMin = "0.00", UIMin = "0.00", ClampMax = "256.00", UIMax = "256.00"))
 		float AngularMaxForceCoefficient;
 
 	// Use the custom angular values on this grip
@@ -839,6 +1088,7 @@ public:
 		PhysicsConstraintType(EPhysicsGripConstraintType::AccelerationConstraint),
 		PhysicsGripLocationSettings(EPhysicsGripCOMType::COM_Default),
 		bTurnOffGravityDuringGrip(false),
+		bSkipSettingSimulating(false),
 		LinearMaxForceCoefficient(0.f),
 		AngularMaxForceCoefficient(0.f),
 		bUseCustomAngularValues(false),
@@ -852,6 +1102,7 @@ public:
 		return (bUsePhysicsSettings == Other.bUsePhysicsSettings &&
 			PhysicsGripLocationSettings == Other.PhysicsGripLocationSettings &&
 			bTurnOffGravityDuringGrip == Other.bTurnOffGravityDuringGrip &&
+			bSkipSettingSimulating == Other.bSkipSettingSimulating &&
 			bUseCustomAngularValues == Other.bUseCustomAngularValues &&
 			PhysicsConstraintType == Other.PhysicsConstraintType &&
 			FMath::IsNearlyEqual(LinearMaxForceCoefficient, Other.LinearMaxForceCoefficient) &&
@@ -867,6 +1118,7 @@ public:
 		return (bUsePhysicsSettings != Other.bUsePhysicsSettings ||
 			PhysicsGripLocationSettings != Other.PhysicsGripLocationSettings ||
 			bTurnOffGravityDuringGrip != Other.bTurnOffGravityDuringGrip ||
+			bSkipSettingSimulating != Other.bSkipSettingSimulating ||
 			bUseCustomAngularValues != Other.bUseCustomAngularValues ||
 			PhysicsConstraintType != Other.PhysicsConstraintType ||
 			!FMath::IsNearlyEqual(LinearMaxForceCoefficient, Other.LinearMaxForceCoefficient) ||
@@ -893,6 +1145,7 @@ public:
 
 			//Ar << bTurnOffGravityDuringGrip;
 			Ar.SerializeBits(&bTurnOffGravityDuringGrip, 1);
+			Ar.SerializeBits(&bSkipSettingSimulating, 1);
 
 
 			// This is 0.0 - 256.0, using compression to get it smaller, 8 bits = max 256 + 1 bit for sign and 7 bits precision for 128 / full 2 digit precision
@@ -984,6 +1237,9 @@ public:
 	UPROPERTY(BlueprintReadWrite, Category = "SecondaryGripInfo")
 		bool bIsSlotGrip;
 
+	UPROPERTY(BlueprintReadWrite, Category = "SecondaryGripInfo")
+		FName SecondarySlotName;
+
 	// Lerp transitions
 	// Max value is 16 seconds with two decimal precision, this is to reduce replication overhead
 	UPROPERTY()
@@ -1012,6 +1268,7 @@ public:
 		SecondaryAttachment(nullptr),
 		SecondaryRelativeTransform(FTransform::Identity),
 		bIsSlotGrip(false),
+		SecondarySlotName(NAME_None),
 		LerpToRate(0.0f),
 		SecondaryGripDistance(0.0f),
 		GripLerpState(EGripLerpState::NotLerping),
@@ -1030,6 +1287,7 @@ public:
 		{
 			this->SecondaryRelativeTransform = Other.SecondaryRelativeTransform;
 			this->bIsSlotGrip = Other.bIsSlotGrip;
+			this->SecondarySlotName = Other.SecondarySlotName;
 		}
 
 		this->LerpToRate = Other.LerpToRate;
@@ -1052,6 +1310,8 @@ public:
 
 			//Ar << bIsSlotGrip;
 			Ar.SerializeBits(&bIsSlotGrip, 1);
+
+			Ar << SecondarySlotName;
 		}
 
 		// This is 0.0 - 16.0, using compression to get it smaller, 4 bits = max 16 + 1 bit for sign and 7 bits precision for 128 / full 2 digit precision
@@ -1101,12 +1361,18 @@ public:
 		bool bIsSlotGrip;
 	UPROPERTY(BlueprintReadWrite, Category = "Settings")
 		FName GrippedBoneName;
+	UPROPERTY(BlueprintReadWrite, Category = "Settings")
+		FName SlotName;
 	UPROPERTY(BlueprintReadOnly, Category = "Settings")
 		EGripMovementReplicationSettings GripMovementReplicationSetting;
 
 	// Whether the grip is currently paused
 	UPROPERTY(BlueprintReadWrite, NotReplicated, Category = "Settings")
 		bool bIsPaused;
+
+	// When true, will lock a hybrid grip into its collision state
+	UPROPERTY(BlueprintReadWrite, NotReplicated, Category = "Settings")
+		bool bLockHybridGrip;
 
 	// I would have loved to have both of these not be replicated (and in normal grips they wouldn't have to be)
 	// However for serialization purposes and Client_Authority grips they need to be....
@@ -1122,11 +1388,6 @@ public:
 
 	UPROPERTY(BlueprintReadOnly, Category = "Settings")
 		FBPAdvGripSettings AdvancedGripSettings;
-
-
-	// When true the grips movement logic will not be performed until it is false again
-	//UPROPERTY(BlueprintReadWrite)
-		//bool bPauseGrip;
 
 	// For multi grip situations
 	UPROPERTY(BlueprintReadOnly, Category = "Settings")
@@ -1148,7 +1409,23 @@ public:
 	FTransform LastWorldTransform;
 
 	// Need to skip one frame of length check post teleport with constrained objects, the constraint may have not been updated yet.
+	bool bSkipNextTeleportCheck;
+
+	// Need to skip one frame of length check post teleport with constrained objects, the constraint may have not been updated yet.
 	bool bSkipNextConstraintLengthCheck;
+
+	// Lerp settings if we are using global lerping
+	float CurrentLerpTime;
+	float LerpSpeed;
+	FTransform OnGripTransform;
+
+	UPROPERTY(BlueprintReadOnly, NotReplicated, Category = "Settings")
+	bool bIsLerping;
+
+	bool IsLocalAuthGrip()
+	{
+		return GripMovementReplicationSetting == EGripMovementReplicationSettings::ClientSide_Authoritive || GripMovementReplicationSetting == EGripMovementReplicationSettings::ClientSide_Authoritive_NoRep;
+	}
 
 	// Cached values - since not using a full serialize now the old array state may not contain what i need to diff
 	// I set these in On_Rep now and check against them when new replications happen to control some actions.
@@ -1171,10 +1448,16 @@ public:
 		bIsLocked = false;
 		LastLockedRotation = FQuat::Identity;
 		LastWorldTransform.SetIdentity();
+		bSkipNextTeleportCheck = false;
 		bSkipNextConstraintLengthCheck = false;
 		bIsPaused = false;
+		bLockHybridGrip = false;
 		AdditionTransform = FTransform::Identity;
 		GripDistance = 0.0f;
+		CurrentLerpTime = 0.f;
+		LerpSpeed = 0.f;
+		OnGripTransform = FTransform::Identity;
+		bIsLerping = false;
 
 		// Clear out the secondary grip
 		SecondaryGripInfo.ClearNonReppingItems();
@@ -1191,9 +1474,10 @@ public:
 		this->RelativeTransform = Other.RelativeTransform;
 		this->bIsSlotGrip = Other.bIsSlotGrip;
 		this->GrippedBoneName = Other.GrippedBoneName;
+		this->SlotName = Other.SlotName;
 		this->GripMovementReplicationSetting = Other.GripMovementReplicationSetting;
-		this->bOriginalReplicatesMovement = Other.bOriginalReplicatesMovement;
-		this->bOriginalGravity = Other.bOriginalGravity;
+		//this->bOriginalReplicatesMovement = Other.bOriginalReplicatesMovement;
+		//this->bOriginalGravity = Other.bOriginalGravity;
 		this->Damping = Other.Damping;
 		this->Stiffness = Other.Stiffness;
 		this->AdvancedGripSettings = Other.AdvancedGripSettings;		
@@ -1268,8 +1552,10 @@ public:
 		RelativeTransform(FTransform::Identity),
 		bIsSlotGrip(false),
 		GrippedBoneName(NAME_None),
+		SlotName(NAME_None),
 		GripMovementReplicationSetting(EGripMovementReplicationSettings::ForceClientSideMovement),
 		bIsPaused(false),
+		bLockHybridGrip(false),
 		bOriginalReplicatesMovement(false),
 		bOriginalGravity(false),
 		Damping(200.0f),
@@ -1279,7 +1565,12 @@ public:
 		bIsLocked(false),
 		LastLockedRotation(FRotator::ZeroRotator),
 		LastWorldTransform(FTransform::Identity),
-		bSkipNextConstraintLengthCheck(false)
+		bSkipNextTeleportCheck(false),
+		bSkipNextConstraintLengthCheck(false),
+		CurrentLerpTime(0.f),
+		LerpSpeed(0.f),
+		OnGripTransform(FTransform::Identity),
+		bIsLerping(false)
 	{
 	}	
 
@@ -1436,6 +1727,8 @@ public:
 	FTransform RootBoneRotation;
 
 	bool bSetCOM;
+	bool bSkipResettingCom;
+	bool bSkipMassCheck;
 
 	FBPActorPhysicsHandleInformation()
 	{	
@@ -1445,6 +1738,11 @@ public:
 		GripID = INVALID_VRGRIP_ID;
 		RootBoneRotation = FTransform::Identity;
 		bSetCOM = false;
+		bSkipResettingCom = false;
+		bSkipMassCheck = false;
+#if WITH_CHAOS
+		KinActorData2 = nullptr;
+#endif
 	}
 
 	FORCEINLINE bool operator==(const FBPActorGripInformation & Other) const
@@ -1472,9 +1770,11 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Constraint, meta = (ClampMin = "0.0"))
 		float Damping;
 
-	/** The force limit of the drive. */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Constraint, meta = (ClampMin = "0.0"))
-		float MaxForce;
+	// A multiplier to add to the stiffness that is then set as the MaxForce
+	// It is clamped between 0.00 and 256.00 to save in replication cost, a value of 0 will mean max force is infinite as it will multiply it to zero (legacy behavior)
+	// If you want an exact value you can figure it out as a factor of the stiffness
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "PhysicsSettings", meta = (ClampMin = "0.00", UIMin = "0.00", ClampMax = "256.00", UIMax = "256.00"))
+		float MaxForceCoefficient;
 
 	/** Enables/Disables position drive (orientation if using angular drive)*/
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Constraint)
@@ -1488,7 +1788,7 @@ public:
 	{
 		Stiffness = 0.f;
 		Damping = 0.f;
-		MaxForce = 0.f;
+		MaxForceCoefficient = 0.f;
 		bEnablePositionDrive = false;
 		bEnableVelocityDrive = false;
 	}
@@ -1497,7 +1797,7 @@ public:
 	{
 		Damping = ConstraintDrive.Damping;
 		Stiffness = ConstraintDrive.Stiffness;
-		MaxForce = ConstraintDrive.MaxForce;
+		MaxForceCoefficient = ConstraintDrive.MaxForce / Stiffness;
 		bEnablePositionDrive = ConstraintDrive.bEnablePositionDrive;
 		bEnableVelocityDrive = ConstraintDrive.bEnableVelocityDrive;
 	}
@@ -1506,7 +1806,7 @@ public:
 	{
 		ConstraintDrive.Damping = Damping;
 		ConstraintDrive.Stiffness = Stiffness;
-		ConstraintDrive.MaxForce = MaxForce;
+		ConstraintDrive.MaxForce = MaxForceCoefficient * Stiffness;
 		ConstraintDrive.bEnablePositionDrive = bEnablePositionDrive;
 		ConstraintDrive.bEnableVelocityDrive = bEnableVelocityDrive;
 	}

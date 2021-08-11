@@ -55,11 +55,9 @@ void UVRButtonComponent::PreReplication(IRepChangedPropertyTracker & ChangedProp
 	// Replicate the levers initial transform if we are replicating movement
 	//DOREPLIFETIME_ACTIVE_OVERRIDE(UVRButtonComponent, InitialRelativeTransform, bReplicateMovement);
 	
-	PRAGMA_DISABLE_DEPRECATION_WARNINGS
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeLocation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeRotation, bReplicateMovement);
-	DOREPLIFETIME_ACTIVE_OVERRIDE(USceneComponent, RelativeScale3D, bReplicateMovement);
-	PRAGMA_ENABLE_DEPRECATION_WARNINGS
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeLocation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeRotation, bReplicateMovement);
+	DOREPLIFETIME_ACTIVE_OVERRIDE_PRIVATE_PROPERTY(USceneComponent, RelativeScale3D, bReplicateMovement);
 }
 
 void UVRButtonComponent::OnRegister()
@@ -84,7 +82,7 @@ void UVRButtonComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 	// Call supers tick (though I don't think any of the base classes to this actually implement it)
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 
-	const float WorldTime = GetWorld()->GetTimeSeconds();
+	const float WorldTime = GetWorld()->GetRealTimeSeconds();
 
 	if (LocalInteractingComponent.IsValid())
 	{
@@ -118,7 +116,6 @@ void UVRButtonComponent::TickComponent(float DeltaTime, enum ELevelTick TickType
 					(StateChangeAuthorityType == EVRStateChangeAuthorityType::CanChangeState_Server && GetNetMode() < ENetMode::NM_Client) ||
 					(StateChangeAuthorityType == EVRStateChangeAuthorityType::CanChangeState_Owner && LocalLastInteractingActor.IsValid() && LocalLastInteractingActor->HasLocalNetOwner()))
 				{
-
 					if (!bToggledThisTouch && NewDepth <= (-ButtonEngageDepth) + KINDA_SMALL_NUMBER && (WorldTime - LastToggleTime) >= MinTimeBetweenEngaging)
 					{
 						LastToggleTime = WorldTime;
@@ -362,7 +359,7 @@ void UVRButtonComponent::SetButtonState(bool bNewButtonState, bool bCallButtonCh
 
 	bButtonState = bNewButtonState;
 	SetButtonToRestingPosition(!bSnapIntoPosition);
-	LastToggleTime = GetWorld()->GetTimeSeconds();
+	LastToggleTime = GetWorld()->GetRealTimeSeconds();
 
 	if (bCallButtonChangedEvent)
 	{

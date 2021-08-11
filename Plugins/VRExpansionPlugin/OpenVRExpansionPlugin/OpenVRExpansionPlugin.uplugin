@@ -1,13 +1,13 @@
 {
 	"FileVersion": 3,
-	"Version": 4.24,
-	"VersionName": "4.24",
+	"Version": 4.25,
+	"VersionName": "4.25",
 	"FriendlyName": "OpenVRExpansionPlugin",
 	"Description": "Adds several new Steam/Open VR features & components to UE4",
 	"Category": "VRExpansion",
 	"CreatedBy": "Joshua (MordenTral) Statzer",
-	"CreatedByURL": "",
-	"DocsURL": "",
+	"CreatedByURL": "http://www.vreue4.com",
+	"DocsURL": "http://www.vreue4.com",
 	"MarketplaceURL": "",
 	"SupportURL": "",
 	"EnabledByDefault": true,
@@ -18,13 +18,7 @@
 		{
 			"Name": "OpenVRExpansionPlugin",
 			"Type": "RunTime",
-			"LoadingPhase": "Default",
-			"WhitelistPlatforms" :
-			[
-				"Win64",
-				"Win32",
-				"Linux"
-			]
+			"LoadingPhase": "Default"
 		}
 	],
 	"Plugins": [

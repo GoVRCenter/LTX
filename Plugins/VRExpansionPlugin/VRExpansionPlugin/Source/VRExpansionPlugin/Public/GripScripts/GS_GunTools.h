@@ -53,7 +53,7 @@ public:
 
 	// Used to smooth filter the virtual stocks primary hand location
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GunSettings|VirtualStock|Smoothing")
-		FBPEuroLowPassFilter StockHandSmoothing;
+		FBPEuroLowPassFilterTrans StockHandSmoothing;
 
 	// Draw debug elements showing the virtual stock location and angles to interacting components
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GunSettings|VirtualStock|Debug")
@@ -158,6 +158,19 @@ public:
 
 	virtual void OnGrip_Implementation(UGripMotionControllerComponent * GrippingController, const FBPActorGripInformation & GripInformation) override;
 	virtual void OnSecondaryGrip_Implementation(UGripMotionControllerComponent * Controller, USceneComponent * SecondaryGripComponent, const FBPActorGripInformation & GripInformation) override;
+	virtual void OnBeginPlay_Implementation(UObject* CallingOwner) override;
+	virtual void HandlePrePhysicsHandle(UGripMotionControllerComponent* GrippingController, const FBPActorGripInformation &GripInfo, FBPActorPhysicsHandleInformation* HandleInfo, FTransform& KinPose) override;
+	//virtual void HandlePostPhysicsHandle(UGripMotionControllerComponent* GrippingController, FBPActorPhysicsHandleInformation* HandleInfo) override;
+
+
+	// The name of the component that is used to orient the weapon along its primary axis
+	// If it does not exist then the weapon is assumed to be X+ facing.
+	// Also used to perform some calculations, make sure it is parented to the gripped object (root component for actors),
+	// and that the X+ vector of the orientation component is facing the forward direction of the weapon (gun tip for guns, ect).
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Weapon Settings")
+		FName WeaponRootOrientationComponent;
+	FTransform OrientationComponentRelativeFacing;
+	FQuat StoredRootOffset;
 
 	// (default false) If true will run through the entire simulation that the owning client uses for the gun. If false, does a lighter and more performant approximation.
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "GunSettings")
@@ -167,6 +180,9 @@ public:
 	FGunTools_AdvSecondarySettings AdvSecondarySettings;
 
 	// Offset to apply to the pivot (good for centering pivot into the palm ect).
+	// For this to apply to the physical center of mass as well an OrientationComponent needs to be defined
+	// So that we have a valid directional vector to work off of, otherwise the pivot will be in component space and you 
+	// will have a harder time aligning it if the weapon is off axis (still works, just less intuitive).
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Pivot")
 		FVector_NetQuantize100 PivotOffset;
 
@@ -221,6 +237,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recoil")
 		bool bHasRecoil;
 
+	// If true then the recoil will be added as a physical force instead of logical blend
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recoil")
+		bool bApplyRecoilAsPhysicalForce;
+
 	// Maximum recoil addition
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Recoil", meta = (editcondition = "bHasRecoil"))
 		FVector_NetQuantize100 MaxRecoilTranslation;
@@ -247,8 +267,11 @@ public:
 
 	bool bHasActiveRecoil;
 	
+	// Adds a recoil instance to the gun tools, the option location is for if using the physical recoil mode
+	// Physical recoil is in world space and positional only, logical recoil is in relative space to the mesh itself and uses all
+	// of the transforms properties.
 	UFUNCTION(BlueprintCallable, Category = "Recoil")
-		void AddRecoilInstance(const FTransform & RecoilAddition);
+		void AddRecoilInstance(const FTransform & RecoilAddition, FVector Optional_Location = FVector::ZeroVector);
 
 	UFUNCTION(BlueprintCallable, Category = "Recoil")
 		void ResetRecoil();

@@ -38,8 +38,8 @@ bool UVRGripScriptBase::IsScriptActive() { return bIsActive; }
 //bool UVRGripScriptBase::Wants_DenyAutoDrop() { return bDenyAutoDrop; }
 //bool UVRGripScriptBase::Wants_DenyLateUpdates() { return bDenyLateUpdates; }
 //bool UVRGripScriptBase::Wants_ToForceDrop() { return bForceDrop; }
-//bool UVRGripScriptBase::Wants_DenyTeleport_Implementation() { return false; }
-void UVRGripScriptBase::HandlePrePhysicsHandle(UGripMotionControllerComponent* GrippingController, FBPActorPhysicsHandleInformation * HandleInfo, FTransform & KinPose) {}
+bool UVRGripScriptBase::Wants_DenyTeleport_Implementation(UGripMotionControllerComponent * Controller) { return false; }
+void UVRGripScriptBase::HandlePrePhysicsHandle(UGripMotionControllerComponent* GrippingController, const FBPActorGripInformation &GripInfo, FBPActorPhysicsHandleInformation * HandleInfo, FTransform & KinPose) {}
 void UVRGripScriptBase::HandlePostPhysicsHandle(UGripMotionControllerComponent* GrippingController, FBPActorPhysicsHandleInformation * HandleInfo) {}
 
 UVRGripScriptBase* UVRGripScriptBase::GetGripScriptByClass(UObject* WorldContextObject, TSubclassOf<UVRGripScriptBase> GripScriptClass, EBPVRResultSwitch& Result)
@@ -51,7 +51,7 @@ UVRGripScriptBase* UVRGripScriptBase::GetGripScriptByClass(UObject* WorldContext
 		{
 			for (UVRGripScriptBase* Script : GripScripts)
 			{
-				if (Script->IsA(GripScriptClass))
+				if (Script && Script->IsA(GripScriptClass))
 				{
 					Result = EBPVRResultSwitch::OnSucceeded;
 					return Script;
@@ -177,8 +177,16 @@ bool UVRGripScriptBase::CallRemoteFunction(UFunction * Function, void * Parms, F
 
 int32 UVRGripScriptBase::GetFunctionCallspace(UFunction * Function, FFrame * Stack)
 {
-	AActor* Owner = GetOwner();// Cast<AActor>(GetOuter());
-	return (Owner ? Owner->GetFunctionCallspace(Function, Stack) : FunctionCallspace::Local);
+	AActor* Owner = GetOwner();
+
+	if (HasAnyFlags(RF_ClassDefaultObject) || !IsSupportedForNetworking() || !Owner)
+	{
+		// This handles absorbing authority/cosmetic
+		return GEngine->GetGlobalFunctionCallspace(Function, this, Stack);
+	}
+
+	// Owner is certified valid now
+	return Owner->GetFunctionCallspace(Function, Stack);
 }
 
 FTransform UVRGripScriptBase::GetGripTransform(const FBPActorGripInformation &Grip, const FTransform & ParentTransform)
@@ -186,20 +194,62 @@ FTransform UVRGripScriptBase::GetGripTransform(const FBPActorGripInformation &Gr
 	return Grip.RelativeTransform * Grip.AdditionTransform * ParentTransform;
 }
 
-FTransform UVRGripScriptBase::GetParentTransform(bool bGetWorldTransform)
+USceneComponent * UVRGripScriptBase::GetParentSceneComp()
 {
-	UObject * ParentObj = this->GetParent();
+	UObject* ParentObj = this->GetParent();
 
 	if (USceneComponent * PrimParent = Cast<USceneComponent>(ParentObj))
 	{
-		return bGetWorldTransform ? PrimParent->GetComponentTransform() : PrimParent->GetRelativeTransform();
+		return PrimParent;
 	}
 	else if (AActor * ParentActor = Cast<AActor>(ParentObj))
+	{
+		return ParentActor->GetRootComponent();
+	}
+
+	return nullptr;
+}
+
+FTransform UVRGripScriptBase::GetParentTransform(bool bGetWorldTransform, FName BoneName)
+{
+	UObject* ParentObj = this->GetParent();
+
+	if (USceneComponent* PrimParent = Cast<USceneComponent>(ParentObj))
+	{
+		if (BoneName != NAME_None)
+		{
+			return PrimParent->GetSocketTransform(BoneName);
+		}
+		else
+		{
+			return PrimParent->GetComponentTransform();
+		}
+	}
+	else if (AActor* ParentActor = Cast<AActor>(ParentObj))
 	{
 		return ParentActor->GetActorTransform();
 	}
 
 	return FTransform::Identity;
+}
+
+FBodyInstance * UVRGripScriptBase::GetParentBodyInstance(FName OptionalBoneName)
+{
+	UObject * ParentObj = this->GetParent();
+
+	if (UPrimitiveComponent * PrimParent = Cast<UPrimitiveComponent>(ParentObj))
+	{
+		return PrimParent->GetBodyInstance(OptionalBoneName);
+	}
+	else if (AActor * ParentActor = Cast<AActor>(ParentObj))
+	{
+		if (UPrimitiveComponent * Prim = Cast<UPrimitiveComponent>(ParentActor->GetRootComponent()))
+		{
+			return Prim->GetBodyInstance(OptionalBoneName);
+		}
+	}
+
+	return nullptr;
 }
 
 UObject * UVRGripScriptBase::GetParent()
@@ -246,6 +296,23 @@ bool UVRGripScriptBase::IsServer()
 	return false;
 }
 
+UWorld* UVRGripScriptBase::GetWorld() const
+{
+	if (IsTemplate())
+		return nullptr;
+
+	if (GIsEditor && !GIsPlayInEditorWorld)
+	{
+		return nullptr;
+	}
+	else if (UObject * Outer = GetOuter())
+	{
+		return Outer->GetWorld();
+	}
+
+	return nullptr;
+}
+
 void UVRGripScriptBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	OnEndPlay(EndPlayReason);
@@ -253,8 +320,30 @@ void UVRGripScriptBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void UVRGripScriptBase::BeginPlay(UObject * CallingOwner)
 {
+	if (bAlreadyNotifiedPlay)
+		return;
+
+	bAlreadyNotifiedPlay = true;
+
 	// Notify the subscripts about begin play
 	OnBeginPlay(CallingOwner);
+}
+
+void UVRGripScriptBase::PostInitProperties()
+{
+	Super::PostInitProperties();
+
+	//Called in game, when World exist . BeginPlay will not be called in editor
+	if (GetWorld())
+	{
+		if (AActor* Owner = GetOwner())
+		{
+			if (Owner->IsActorInitialized())
+			{
+				BeginPlay(GetOwner());
+			}
+		}
+	}
 }
 
 void UVRGripScriptBaseBP::Tick(float DeltaTime)
