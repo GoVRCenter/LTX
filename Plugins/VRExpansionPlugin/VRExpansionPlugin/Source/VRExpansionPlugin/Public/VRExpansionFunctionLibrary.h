@@ -6,6 +6,7 @@
 #include "Kismet/BlueprintFunctionLibrary.h"
 #include "Components/SplineComponent.h"
 #include "Components/SplineMeshComponent.h"
+#include "Components/PrimitiveComponent.h"
 
 //#include "HeadMountedDisplay.h" 
 #include "HeadMountedDisplayFunctionLibrary.h"
@@ -41,6 +42,10 @@ class VREXPANSIONPLUGIN_API UVRExpansionFunctionLibrary : public UBlueprintFunct
 	GENERATED_BODY()
 	//~UVRExpansionFunctionLibrary();
 public:
+
+	UFUNCTION(BlueprintPure, Category = "VRExpansionFunctions", meta = (WorldContext = "WorldContextObject", CallableWithoutWorldContext))
+		static UGameViewportClient * GetGameViewportClient(UObject* WorldContextObject);
+
 
 	// Applies a delta rotation around a pivot point, if bUseOriginalYawOnly is true then it only takes the original Yaw into account (characters)
 	UFUNCTION(BlueprintCallable, Category = "VRExpansionFunctions", meta = (bIgnoreSelf = "true"))
@@ -176,7 +181,7 @@ public:
 
 	// Gets if an actors root component contains a grip slot within range
 	UFUNCTION(BlueprintPure, Category = "VRGrip", meta = (bIgnoreSelf = "true", DisplayName = "GetGripSlotInRangeByTypeName_Component"))
-	static void GetGripSlotInRangeByTypeName_Component(FName SlotType, UPrimitiveComponent * Component, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent* QueryController = nullptr);
+	static void GetGripSlotInRangeByTypeName_Component(FName SlotType, USceneComponent * Component, FVector WorldLocation, float MaxRange, bool & bHadSlotInRange, FTransform & SlotWorldTransform, FName & SlotName, UGripMotionControllerComponent* QueryController = nullptr);
 
 	/* Returns true if the values are equal (A == B) */
 	UFUNCTION(BlueprintPure, meta = (DisplayName = "Equal VR Grip", CompactNodeTitle = "==", Keywords = "== equal"), Category = "VRExpansionFunctions")

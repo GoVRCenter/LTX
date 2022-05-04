@@ -50,6 +50,9 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FVROnControllerGripSignature, const 
 /** Delegate for notification when the controller drops a gripped object. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FVROnControllerDropSignature, const FBPActorGripInformation &, GripInformation, bool, bWasSocketed);
 
+/** Delegate for notification when the controller sockets a gripped object. */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_FiveParams(FVROnControllerSocketSignature, const FBPActorGripInformation&, GripInformation, const USceneComponent*, NewParentComp, FName, OptionalSocketName, FTransform, RelativeTransformToParent, bool, bWeldingBodies);
+
 /** Delegate for notification when the controller teleports its grips. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE(FVROnControllerTeleportedGripsSignature);
 
@@ -73,7 +76,7 @@ public:
 	void Setup(const FTransform& ParentToWorld, UGripMotionControllerComponent* Component, bool bSkipLateUpdate);
 
 	/** Apply the late update delta to the cached components */
-	void Apply_RenderThread(FSceneInterface* Scene, const int32 FrameNumber, const FTransform& OldRelativeTransform, const FTransform& NewRelativeTransform);
+	void Apply_RenderThread(FSceneInterface* Scene, const FTransform& OldRelativeTransform, const FTransform& NewRelativeTransform);
 	
 	/** Returns true if the LateUpdateSetup data is stale. */
 	bool GetSkipLateUpdate_RenderThread() const { return UpdateStates[LateUpdateRenderReadIndex].bSkip; }
@@ -191,10 +194,6 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController")
 	bool bOffsetByHMD;
 
-	// When true any physics constraints will be attached to the grip pivot instead of a new kinematic actor in the scene
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GripMotionController")
-		bool bConstrainToPivot;
-
 	UPROPERTY()
 		TWeakObjectPtr<AVRBaseCharacter> AttachChar;
 	void UpdateTracking(float DeltaTime);
@@ -308,6 +307,11 @@ public:
 	// Called when a object is dropped
 	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
 		FVROnControllerDropSignature OnDroppedObject;
+
+	// Called when a object is being socketed, prior to OnDrop being called and prior to the actual socketing being performed
+	// Generally an early entry to detach hands and handle pre-socketing logic
+	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
+		FVROnControllerSocketSignature OnSocketingObject;
 
 	// Called when a gripped object has been teleported
 	UPROPERTY(BlueprintAssignable, Category = "Grip Events")
@@ -1344,9 +1348,9 @@ private:
 		virtual void BeginRenderViewFamily(FSceneViewFamily& InViewFamily) override;
 		virtual void PreRenderView_RenderThread(FRHICommandListImmediate& RHICmdList, FSceneView& InView) override {}
 		virtual void PreRenderViewFamily_RenderThread(FRHICommandListImmediate& RHICmdList, FSceneViewFamily& InViewFamily) override;
-		virtual void LateLatchingViewFamily_RenderThread(FRHICommandListImmediate& RHICmdList, FSceneViewFamily& InViewFamily) override;
 
 		virtual int32 GetPriority() const override { return -10; }
+		virtual bool IsActiveThisFrame(class FViewport* InViewport) const;
 
 	private:
 		friend class UGripMotionControllerComponent;

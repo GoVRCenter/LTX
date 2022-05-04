@@ -903,10 +903,7 @@ enum class EGripCollisionType : uint8
 	CustomGrip,
 
 	/** A grip that does not tick or move, used for drop / grip events only and uses least amount of processing. */
-	EventsOnly,
-
-	/** Uses a hard constraint with no softness to lock them together, best used with ConstrainToPivot enabled and a bone chain. */
-	LockedConstraint
+	EventsOnly
 
 };
 
@@ -1207,17 +1204,23 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AdvancedGripSettings")
 		bool bSetOwnerOnGrip;
 
+	// If true, we will be bypassed on global lerp operations
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AdvancedGripSettings")
+		bool bDisallowLerping;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "AdvancedGripSettings")
 		FBPAdvGripPhysicsSettings PhysicsSettings;
 
 	FBPAdvGripSettings() :
 		GripPriority(1),
-		bSetOwnerOnGrip(1)
+		bSetOwnerOnGrip(1),
+		bDisallowLerping(0)
 	{}
 
 	FBPAdvGripSettings(int GripPrio) :
 		GripPriority(GripPrio),
-		bSetOwnerOnGrip(1)
+		bSetOwnerOnGrip(1),
+		bDisallowLerping(0)
 	{}
 };
 
@@ -1732,7 +1735,6 @@ public:
 	bool bSetCOM;
 	bool bSkipResettingCom;
 	bool bSkipMassCheck;
-	bool bSkipDeletingKinematicActor;
 
 	FBPActorPhysicsHandleInformation()
 	{	
@@ -1744,7 +1746,6 @@ public:
 		bSetCOM = false;
 		bSkipResettingCom = false;
 		bSkipMassCheck = false;
-		bSkipDeletingKinematicActor = false;
 #if WITH_CHAOS
 		KinActorData2 = nullptr;
 #endif

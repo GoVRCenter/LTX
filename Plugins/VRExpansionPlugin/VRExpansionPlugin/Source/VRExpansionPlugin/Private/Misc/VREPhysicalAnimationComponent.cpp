@@ -78,7 +78,7 @@ FTransform UVREPhysicalAnimationComponent::GetRefPoseBoneRelativeTransform(USkel
 	{
 		//SkelMesh->ClearRefPoseOverride();
 		FReferenceSkeleton RefSkel;
-		RefSkel = SkeleMesh->SkeletalMesh->GetRefSkeleton();
+		RefSkel = SkeleMesh->SkeletalMesh->RefSkeleton;
 
 		BoneTransform = GetWorldSpaceRefBoneTransform(RefSkel, RefSkel.FindBoneIndex(BoneName), RefSkel.FindBoneIndex(ParentBoneName));
 	}
